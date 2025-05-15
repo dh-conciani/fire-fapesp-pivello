@@ -85,12 +85,15 @@ for(i in 1:length(toProcess)) {
     fire_native <- fire_native$addBands(fire_ij)
     
   }
-  
-  ## get bandNames
-  bands <- fire_native$bandNames()$getInfo()
-  
+
   # Remove "constant"
-  bands_filtered <- bands[bands != "constant"]
+  bands_filtered <- c('burned_1985', 'burned_1986', 'burned_1987', 'burned_1988', 'burned_1989', 'burned_1990',
+                      'burned_1991', 'burned_1992', 'burned_1993', 'burned_1994', 'burned_1995',
+                      'burned_1996', 'burned_1997', 'burned_1998', 'burned_1999',
+                      'burned_2000', 'burned_2001', 'burned_2002', 'burned_2003', 'burned_2004', 'burned_2005',
+                      'burned_2006', 'burned_2007', 'burned_2008', 'burned_2009', 'burned_2010', 'burned_2011',
+                      'burned_2012', 'burned_2013', 'burned_2014', 'burned_2015', 'burned_2016', 'burned_2017',
+                      'burned_2018', 'burned_2019', 'burned_2020', 'burned_2021', 'burned_2022', 'burned_2023')
   
   # Select only desired bands
   fire_native <- fire_native$select(bands_filtered)
@@ -113,7 +116,7 @@ for(i in 1:length(toProcess)) {
     scale = 30,          ##  native resolution
     geometries= FALSE    ## ensures output is point features
   )
-  
+
   ## build task to export data
   task <- ee$batch$Export$table$toDrive(
     collection= points,

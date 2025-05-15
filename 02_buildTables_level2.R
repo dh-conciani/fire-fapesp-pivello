@@ -119,10 +119,11 @@ for(i in 1:length(toProcess)) {
 
   ## build task to export data
   task <- ee$batch$Export$table$toDrive(
-    collection= points,
-    description= paste0(toProcess[i], '_burned_areas'),
-    folder= 'FAPESP_FIRE2',
-    fileFormat= 'CSV'
+    points,
+    paste0(toProcess[i], '_burned_areas'),
+    'FAPESP_FIRE2',
+    NULL,
+    'CSV'
   )
   
   task$start()

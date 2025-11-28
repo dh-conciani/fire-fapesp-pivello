@@ -1,104 +1,84 @@
-// compute burned area for the amazon 
-// dhemerson.costa@ipam.org.br
+// ------------------------------------------
+// INPUTS
+// ------------------------------------------
 
-// set years to be used
-var years = [
-  1985, 1986, 1987, 1988, 1989, 1990, 1991, 1992, 1993, 1994, 1995, 1996, 1997,
-  1998, 1999, 2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 
-  2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 
-  2024
-  ];
-
-
-// read fire area
+// Fire (MapBiomas) image
 var fire = ee.Image('projects/mapbiomas-public/assets/brazil/lulc/collection10/mapbiomas_brazil_collection10_integration_v2');
 
-var recipe = fire;
+// Territory polygons (each feature has a property "Ano")
+var territory = ee.FeatureCollection('users/dh-conciani/help/fire-fapesp/fato-v2-2025-11-28');
 
-// carregar eco regioes
-var territory = ee.FeatureCollection('users/dh-conciani/help/fire-fapesp/fato-v2-2025-11-28')
-  .map(function(feature) {
-    return feature.buffer(1000);
-  })
+// ------------------------------------------
+// PARAMETERS
+// ------------------------------------------
+var pixelScale = 30;        // MapBiomas native resolution
+var areaBandName = 'area_ha';
+var classBandName = 'class';
 
-territory = ee.Image().paint(territory, 'Ev_FgID').rename('territory');
+// ------------------------------------------
+// FUNCTION: compute area by class for one feature,
+//           using its own "Ano" property
+// ------------------------------------------
+function areaByClassForFeature(feat) {
+  // Get the reference year stored in the feature and force to integer
+  var year = ee.Number(feat.get('Ano')).int();
 
-Map.addLayer(territory.randomVisualizer(), {}, 'territory');
+  // Build the classification band name, e.g. "classification_2005"
+  // IMPORTANT: use '%d' to avoid decimal places
+  var bandName = ee.String('classification_').cat(year.format('%d'));
 
-// change the scale if you need.
-var scale = 30;
+  // Classification band for this feature's year
+  var classImg = fire.select(bandName).rename(classBandName);
 
-// define a Google Drive output folder 
-var driverFolder = 'STAT';
+  var areaImg = ee.Image.pixelArea().divide(10000).rename(areaBandName);
+  var stack = areaImg.addBands(classImg);
 
-// get the classification for the file[i] 
-var asset_i = recipe.selfMask();
+  var reducer = ee.Reducer
+    .sum()
+    .group({
+      groupField: 1,
+      groupName: 'class'
+    });
 
-// Image area in hectares
-var pixelArea = ee.Image.pixelArea().divide(10000);
+  var reduced = stack.reduceRegion({
+    reducer: reducer,
+    geometry: feat.geometry(),
+    scale: pixelScale,
+    maxPixels: 1e13
+  });
 
-// Geometry to export
-var geometry = fire.geometry();
+  var groups = ee.List(reduced.get('groups'));
+  var baseProps = feat.toDictionary(feat.propertyNames());
 
-// convert a complex object to a simple feature collection 
-var convert2table = function (obj) {
-  obj = ee.Dictionary(obj);
-    var territory = obj.get('territory');
-    var classesAndAreas = ee.List(obj.get('groups'));
-    
-    var tableRows = classesAndAreas.map(
-        function (classAndArea) {
-            classAndArea = ee.Dictionary(classAndArea);
-            var classId = classAndArea.get('class');
-            var area = classAndArea.get('sum');
-            var tableColumns = ee.Feature(null)
-                .set('territory', territory)
-                .set('class_id', classId)
-                .set('area', area);
-                
-            return tableColumns;
-        }
+  var classFeatures = groups.map(function (g) {
+    g = ee.Dictionary(g);
+    return ee.Feature(
+      null,
+      baseProps.combine({
+        year: year,                 // will be an integer, e.g. 2009
+        class: g.get('class'),
+        area_ha: g.get('sum')
+      }, true)
     );
-  
-    return ee.FeatureCollection(ee.List(tableRows));
-};
+  });
 
-// compute the area
-var calculateArea = function (image, territory, geometry) {
-    var territotiesData = pixelArea.addBands(territory).addBands(image)
-        .reduceRegion({
-            reducer: ee.Reducer.sum().group(1, 'class').group(1, 'territory'),
-            geometry: geometry,
-            scale: scale,
-            maxPixels: 1e13
-        });
-        
-    territotiesData = ee.List(territotiesData.get('groups'));
-    var areas = territotiesData.map(convert2table);
-    areas = ee.FeatureCollection(areas).flatten();
-    return areas;
-};
+  return ee.FeatureCollection(classFeatures);
+}
+// ------------------------------------------
+// APPLY TO ALL FEATURES
+// ------------------------------------------
+var results = ee.FeatureCollection(
+  territory.map(areaByClassForFeature)
+).flatten();
 
-// perform per year 
-var areas = years.map(
-    function (year) {
-        var image = asset_i.select('classification_' + year);
-        var areas = calculateArea(image, territory, geometry);
-        // set additional properties
-        areas = areas.map(
-            function (feature) {
-                return feature.set('year', year);
-            }
-        );
-        return areas;
-    }
-);
+// Inspect the results
+print('Area by class for each feature using its Ano (ha)', results.limit(50));
 
-areas = ee.FeatureCollection(areas).flatten();
-  
+// ------------------------------------------
+// OPTIONAL: EXPORT TO DRIVE
+// ------------------------------------------
 Export.table.toDrive({
-    collection: areas,
-    description: 'lcluc_fire_fapesp_v2',
-    folder: driverFolder,
-    fileFormat: 'CSV'
+  collection: results,
+  description: 'lulc-fapesp-fire-v3',
+  fileFormat: 'CSV'
 });

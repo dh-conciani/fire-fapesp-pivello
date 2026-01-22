@@ -1,17 +1,18 @@
-var asset = 'users/dh-conciani/help/fire-fapesp/fato-v2-2025-11-28';
+var asset = 'users/dh-conciani/help/fire-fapesp/2026-01-22-fire-fapesp-fato';
 var features = ee.FeatureCollection(asset);
 
 print('features',features);
 
 var columns = [
-  'Ev_FgID',
-  'Ano',
-  'M�s',
-  'Dia',
-  'Fonte'
+  'FEvn_ID',
+  'Year',
+  'Month',
+  'Day',
+  'Source',
+  'Locatin'
 ];
 
-var chart = makeTableChart(features, columns, 'Ev_FgID', 300);
+var chart = makeTableChart(features, columns, 'FEvn_ID', 300);
 print('TABELA CRUA', chart);
 
 // --- --- --- AUXILIAR
@@ -38,12 +39,12 @@ var features = features.map(function(feature){
   });
   
   var values = frequencyHistogram.values()
-    .slice(0,ee.List(years).indexOf(feature.getNumber('Ano').add(1)));
+    .slice(0,ee.List(years).indexOf(feature.getNumber('Year').add(1)));
   
   var values_invertida = values.slice(0).reverse();
 
   var keys = frequencyHistogram.keys()
-    .slice(0,ee.List(years).indexOf(feature.getNumber('Ano').add(1)));
+    .slice(0,ee.List(years).indexOf(feature.getNumber('Year').add(1)));
   
   var keys_invertida = keys.slice(0).reverse();
   
@@ -61,14 +62,14 @@ var features = features.map(function(feature){
 
 print('features',features.first(),features.limit(3));
 
-print('+ MÉTRICAS HISTÓRICAS SOBRE O FOGO PRÉTERITO', makeTableChart(features, features.first().propertyNames(), 'Ev_FgID', 300));
+print('+ MÉTRICAS HISTÓRICAS SOBRE O FOGO PRÉTERITO', makeTableChart(features, features.first().propertyNames(), 'FEvn_ID', 300));
 
 // --- --- --- MÉTRICAS DA COBERTURA DA VIZINHANÇA
 var coverage_nivel2_subset = getCoverageMapBiomas(['nivel2']).nivel2;
 print("coverage_nivel2_subset",coverage_nivel2_subset);
 var features = features.map(function(feature){
   
-  var coverage_year = coverage_nivel2_subset.eeObject.select(ee.String('classification_').cat(ee.String(feature.getNumber('Ano').int())))
+  var coverage_year = coverage_nivel2_subset.eeObject.select(ee.String('classification_').cat(ee.String(feature.getNumber('Year').int())))
   
   var legend = coverage_nivel2_subset.legenda;
   
@@ -100,7 +101,7 @@ var features = features.map(function(feature){
   return feature;
 });
 print('features',features.first(),features.limit(3));
-print('+ MÉTRICAS DA COBERTURA DA VIZINHANÇA', makeTableChart(features, features.first().propertyNames(), 'Ev_FgID', 300));
+print('+ MÉTRICAS DA COBERTURA DA VIZINHANÇA', makeTableChart(features, features.first().propertyNames(), 'FEvn_ID', 300));
 
 // --- --- --- MÉTRICAS DE CLIMA
 // Temp. média Max (mês) °C
@@ -155,9 +156,9 @@ function reduceRegion_first (image,geom){
 var features = features.map(function(feature){
   // var feature = features.first();
   
-  var year = feature.getNumber('Ano').int();
-  var month = feature.getNumber('M�s').int();
-  var day = feature.getString('Dia'); day = day.equals('NA') ? '1' : day
+  var year = feature.getNumber('Year').int();
+  var month = feature.getNumber('Month').int();
+  var day = feature.getString('Day'); day = day.equals('NA') ? '1' : day
 
   var pointDate_day = ee.Date(ee.String('').cat(year).cat('-').cat(month).cat('-').cat(day));
   var pointDate_month = ee.Date(ee.String('').cat(year).cat('-').cat(month).cat('-01'));
@@ -221,15 +222,15 @@ var features = features.map(function(feature){
   // print(feature);
 });
 print('features',features.first(),features.limit(3));
-print('+ MÉTRICAS DE CLIMA', makeTableChart(features, features.first().propertyNames(), 'Ev_FgID', 300));
+print('+ MÉTRICAS DE CLIMA', makeTableChart(features, features.first().propertyNames(), 'FEvn_ID', 300));
 
 
 // --- --- --- MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL
 var features = years.map(function(year){
-  return features.filter(ee.Filter.eq('Ano',year))
+  return features.filter(ee.Filter.eq('Year',year))
     .map(function(feature){
-      var month = feature.getNumber('M�s').int();
-      var day = feature.getString('Dia'); day = day.equals('NA') ? '1' : day
+      var month = feature.getNumber('Month').int();
+      var day = feature.getString('Day'); day = day.equals('NA') ? '1' : day
       var landsat_year_collection = getLandsat(year,month,day,feature);
       var combustivel_bands = landsat_year_collection
         .unmask().reduceRegion({
@@ -251,10 +252,10 @@ var features = years.map(function(year){
 });
 features = ee.FeatureCollection(features).flatten();
 print('features',features.first(),features.limit(3));
-print('+ MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL', makeTableChart(features, features.first().propertyNames(), 'Ev_FgID', 300));
+print('+ MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL', makeTableChart(features, features.first().propertyNames(), 'FEvn_ID', 300));
 
 
-var description = 'fato-v3-pluss_metricas'
+var description = '2026-01-22-fato-lulc-climate-stats'
 var folder = 'fire-fapesp'
 Export.table.toDrive({
   collection:features,

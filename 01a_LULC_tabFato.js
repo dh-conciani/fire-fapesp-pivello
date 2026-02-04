@@ -1,4 +1,4 @@
-var asset = 'users/dh-conciani/help/fire-fapesp/2026-01-22-fire-fapesp-fato';
+var asset = 'users/dh-conciani/help/fire-fapesp/2026-02-04-fire-fapesp';
 var features = ee.FeatureCollection(asset);
 
 print('features',features);
@@ -255,7 +255,7 @@ print('features',features.first(),features.limit(3));
 print('+ MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL', makeTableChart(features, features.first().propertyNames(), 'FEvn_ID', 300));
 
 
-var description = '2026-01-22-fato-lulc-climate-stats'
+var description = '2026-02-04-fato-lulc-climate-stats'
 var folder = 'fire-fapesp'
 Export.table.toDrive({
   collection:features,

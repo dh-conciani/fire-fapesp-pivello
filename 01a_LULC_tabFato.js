@@ -1,18 +1,18 @@
-var asset = 'users/dh-conciani/help/fire-fapesp/2026-02-04-fire-fapesp';
+var asset = 'users/dh-conciani/help/fire-fapesp/2026-04-16-fire-fapesp-fato';
 var features = ee.FeatureCollection(asset);
 
 print('features',features);
 
 var columns = [
-  'FEvn_ID',
-  'Year',
+  'Fr_C_ID',
+  'Yr_f_f_',
   'Month',
   'Day',
   'Source',
   'Locatin'
 ];
 
-var chart = makeTableChart(features, columns, 'FEvn_ID', 300);
+var chart = makeTableChart(features, columns, 'Fr_C_ID', 300);
 print('TABELA CRUA', chart);
 
 // --- --- --- AUXILIAR
@@ -39,12 +39,12 @@ var features = features.map(function(feature){
   });
   
   var values = frequencyHistogram.values()
-    .slice(0,ee.List(years).indexOf(feature.getNumber('Year').add(1)));
+    .slice(0,ee.List(years).indexOf(feature.getNumber('Yr_f_f_').add(1)));
   
   var values_invertida = values.slice(0).reverse();
 
   var keys = frequencyHistogram.keys()
-    .slice(0,ee.List(years).indexOf(feature.getNumber('Year').add(1)));
+    .slice(0,ee.List(years).indexOf(feature.getNumber('Yr_f_f_').add(1)));
   
   var keys_invertida = keys.slice(0).reverse();
   
@@ -69,7 +69,7 @@ var coverage_nivel2_subset = getCoverageMapBiomas(['nivel2']).nivel2;
 print("coverage_nivel2_subset",coverage_nivel2_subset);
 var features = features.map(function(feature){
   
-  var coverage_year = coverage_nivel2_subset.eeObject.select(ee.String('classification_').cat(ee.String(feature.getNumber('Year').int())))
+  var coverage_year = coverage_nivel2_subset.eeObject.select(ee.String('classification_').cat(ee.String(feature.getNumber('Yr_f_f_').int())))
   
   var legend = coverage_nivel2_subset.legenda;
   
@@ -156,7 +156,7 @@ function reduceRegion_first (image,geom){
 var features = features.map(function(feature){
   // var feature = features.first();
   
-  var year = feature.getNumber('Year').int();
+  var year = feature.getNumber('Yr_f_f_').int();
   var month = feature.getNumber('Month').int();
   var day = feature.getString('Day'); day = day.equals('NA') ? '1' : day
 
@@ -227,7 +227,7 @@ print('+ MÉTRICAS DE CLIMA', makeTableChart(features, features.first().property
 
 // --- --- --- MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL
 var features = years.map(function(year){
-  return features.filter(ee.Filter.eq('Year',year))
+  return features.filter(ee.Filter.eq('Yr_f_f_',year))
     .map(function(feature){
       var month = feature.getNumber('Month').int();
       var day = feature.getString('Day'); day = day.equals('NA') ? '1' : day
@@ -255,7 +255,7 @@ print('features',features.first(),features.limit(3));
 print('+ MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL', makeTableChart(features, features.first().propertyNames(), 'FEvn_ID', 300));
 
 
-var description = '2026-02-04-fato-lulc-climate-stats'
+var description = '2026-04-16-fato-lulc-climate-stats'
 var folder = 'fire-fapesp'
 Export.table.toDrive({
   collection:features,

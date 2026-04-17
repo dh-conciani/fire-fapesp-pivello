@@ -1,4 +1,4 @@
-var asset = 'users/dh-conciani/help/fire-fapesp/2026-04-16-fire-fapesp-fato';
+var asset = 'users/dh-conciani/help/fire-fapesp/2026-04-17-fire-fapesp-fato';
 var features = ee.FeatureCollection(asset);
 
 print('features',features);
@@ -255,7 +255,7 @@ print('features',features.first(),features.limit(3));
 print('+ MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL', makeTableChart(features, features.first().propertyNames(), 'FEvn_ID', 300));
 
 
-var description = '2026-04-16-fato-lulc-climate-stats'
+var description = '2026-04-17-fato-lulc-climate-stats'
 var folder = 'fire-fapesp'
 Export.table.toDrive({
   collection:features,
@@ -666,7 +666,7 @@ function getCoverageMapBiomas(levelsRequested) {
       50: 'Restinga Herbácea',
 
       15: 'Pastagem',
-      19: 'Lavoura Temporária',
+      19: 'Lavoura Temporária',d
       36: 'Lavoura Perene',
 
       9:  'Silvicultura',

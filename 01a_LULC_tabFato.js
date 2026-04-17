@@ -666,7 +666,7 @@ function getCoverageMapBiomas(levelsRequested) {
       50: 'Restinga Herbácea',
 
       15: 'Pastagem',
-      19: 'Lavoura Temporária',d
+      19: 'Lavoura Temporária',
       36: 'Lavoura Perene',
 
       9:  'Silvicultura',

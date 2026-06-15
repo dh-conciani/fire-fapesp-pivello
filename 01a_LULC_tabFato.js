@@ -1,15 +1,14 @@
-var asset = 'users/dh-conciani/help/fire-fapesp/2026-04-17-fire-fapesp-fato';
+var asset = 'users/dh-conciani/help/fire-fapesp/2026-06-15-tabFato';
 var features = ee.FeatureCollection(asset);
-
 print('features',features);
 
 var columns = [
-  'Fr_C_ID',
-  'Yr_f_f_',
-  'Month',
   'Day',
-  'Source',
-  'Locatin'
+  'Fr_C_ID',
+  'Fr_E_ID',
+  'Locatin',
+  'Month',
+  'Yr_f_f_'
 ];
 
 var chart = makeTableChart(features, columns, 'Fr_C_ID', 300);
@@ -62,7 +61,7 @@ var features = features.map(function(feature){
 
 print('features',features.first(),features.limit(3));
 
-print('+ MÉTRICAS HISTÓRICAS SOBRE O FOGO PRÉTERITO', makeTableChart(features, features.first().propertyNames(), 'FEvn_ID', 300));
+print('+ MÉTRICAS HISTÓRICAS SOBRE O FOGO PRÉTERITO', makeTableChart(features, features.first().propertyNames(), 'Fr_E_ID', 300));
 
 // --- --- --- MÉTRICAS DA COBERTURA DA VIZINHANÇA
 var coverage_nivel2_subset = getCoverageMapBiomas(['nivel2']).nivel2;
@@ -101,7 +100,7 @@ var features = features.map(function(feature){
   return feature;
 });
 print('features',features.first(),features.limit(3));
-print('+ MÉTRICAS DA COBERTURA DA VIZINHANÇA', makeTableChart(features, features.first().propertyNames(), 'FEvn_ID', 300));
+print('+ MÉTRICAS DA COBERTURA DA VIZINHANÇA', makeTableChart(features, features.first().propertyNames(), 'Fr_E_ID', 300));
 
 // --- --- --- MÉTRICAS DE CLIMA
 // Temp. média Max (mês) °C
@@ -222,7 +221,7 @@ var features = features.map(function(feature){
   // print(feature);
 });
 print('features',features.first(),features.limit(3));
-print('+ MÉTRICAS DE CLIMA', makeTableChart(features, features.first().propertyNames(), 'FEvn_ID', 300));
+print('+ MÉTRICAS DE CLIMA', makeTableChart(features, features.first().propertyNames(), 'Fr_E_ID', 300));
 
 
 // --- --- --- MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL
@@ -252,10 +251,10 @@ var features = years.map(function(year){
 });
 features = ee.FeatureCollection(features).flatten();
 print('features',features.first(),features.limit(3));
-print('+ MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL', makeTableChart(features, features.first().propertyNames(), 'FEvn_ID', 300));
+print('+ MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL', makeTableChart(features, features.first().propertyNames(), 'Fr_E_ID', 300));
 
 
-var description = '2026-04-17-fato-lulc-climate-stats'
+var description = '2026-06-15-fato-lulc-climate-stats'
 var folder = 'fire-fapesp'
 Export.table.toDrive({
   collection:features,

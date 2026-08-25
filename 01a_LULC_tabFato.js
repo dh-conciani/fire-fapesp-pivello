@@ -1,6 +1,6 @@
-var asset = 'users/dh-conciani/help/fire-fapesp/2026-06-15-tabFato';
+
+var asset = 'users/dh-conciani/help/fire-fapesp/2026-06-23-fire-fapesp-fato';
 var features = ee.FeatureCollection(asset);
-print('features',features);
 
 var columns = [
   'Day',
@@ -68,11 +68,11 @@ var coverage_nivel2_subset = getCoverageMapBiomas(['nivel2']).nivel2;
 print("coverage_nivel2_subset",coverage_nivel2_subset);
 var features = features.map(function(feature){
   
-  var coverage_year = coverage_nivel2_subset.eeObject.select(ee.String('classification_').cat(ee.String(feature.getNumber('Yr_f_f_').int())))
+  var coverage_year = coverage_nivel2_subset.eeObject.select(ee.String('classification_').cat(ee.String(feature.getNumber('Yr_f_f_').int())));
   
   var legend = coverage_nivel2_subset.legenda;
   
-  var area_ha = ee.Image.pixelArea().divide(10000)
+  var area_ha = ee.Image.pixelArea().divide(10000);
   var area_total = area_ha.reduceRegion({
       reducer:ee.Reducer.sum(),
       geometry:feature.geometry().buffer(1000),
@@ -231,6 +231,8 @@ var features = years.map(function(year){
       var month = feature.getNumber('Month').int();
       var day = feature.getString('Day'); day = day.equals('NA') ? '1' : day
       var landsat_year_collection = getLandsat(year,month,day,feature);
+  
+  
       var combustivel_bands = landsat_year_collection
         .unmask().reduceRegion({
         reducer:ee.Reducer.first(), 
@@ -243,9 +245,17 @@ var features = years.map(function(year){
       
     return feature.set({
       // 'combustivel-bands':combustivel_bands,
-      'combustivel-npv':combustivel_bands.getNumber('npv'),
-      'combustivel-gv':combustivel_bands.getNumber('gv'),
-      'combustivel-soil':combustivel_bands.getNumber('soil'),
+      'SMA-npv':combustivel_bands.getNumber('npv'),
+      'SMA-gv':combustivel_bands.getNumber('gv'),
+      'SMA-soil':combustivel_bands.getNumber('soil'),
+      'SMA-cloud':combustivel_bands.getNumber('cloud'),
+      'SMA-shade':combustivel_bands.getNumber('shade'),
+      'SMA_gvs':combustivel_bands.getNumber('gvs'),
+      'SMA_npvSoil':combustivel_bands.getNumber('npvSoil'),
+      
+
+
+
     });
   });
 });
@@ -253,9 +263,25 @@ features = ee.FeatureCollection(features).flatten();
 print('features',features.first(),features.limit(3));
 print('+ MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL', makeTableChart(features, features.first().propertyNames(), 'Fr_E_ID', 300));
 
+// --- --- --- MÉTRICAS DE KG/M² DOS COMPARTIMENTOS DE CARBONO
 
-var description = '2026-06-15-fato-lulc-climate-stats'
-var folder = 'fire-fapesp'
+var qcn_kg_m2 = ee.Image('projects/ee-ipam/assets/CCAL/public/qcn/qcn_brazil_historical_biomass_carbon_qcn_rect_v1')
+  .select(['TOTAL','AGB','BGB','CDW','LITTER'],['QCN-total','QCN-agb','QCN-bgb','QCN-cdw','QCN-litter']).divide(10);
+var features = qcn_kg_m2.reduceRegions({
+  collection:features, 
+  reducer:ee.Reducer.sum(),
+  scale:30, 
+  // crs, crsTransform, 
+  // tileScale:2,
+  maxPixelsPerRegion:1e13
+});
+  
+print('features',features.first(),features.limit(3));
+print('+ MÉTRICAS DE KG/M² DOS COMPARTIMENTOS DE CARBONO', makeTableChart(features, features.first().propertyNames(), 'Fr_E_ID', 300));
+
+
+var description = '2026-06-26-fato-stats';
+var folder = 'fire-fapesp';
 Export.table.toDrive({
   collection:features,
   description:description,

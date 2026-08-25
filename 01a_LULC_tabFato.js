@@ -1,13 +1,13 @@
 
-var asset = 'users/dh-conciani/help/fire-fapesp/2026-06-23-fire-fapesp-fato';
+var asset = 'users/dh-conciani/help/fire-fapesp/2026-08-21-fire-fapesp-fato';
 var features = ee.FeatureCollection(asset);
 
 var columns = [
   'Day',
   'Fr_C_ID',
   'Fr_E_ID',
-  'Locatin',
   'Month',
+  'Site',
   'Yr_f_f_'
 ];
 
@@ -20,11 +20,12 @@ var years = [
   1985,1986,1987,1988,1989,1990,1991,1992,1993,1994,
   1995,1996,1997,1998,1999,2000,2001,2002,2003,2004,
   2005,2006,2007,2008,2009,2010,2011,2012,2013,2014,
-  2015,2016,2017,2018,2019,2020,2021,2022,2023,2024
+  2015,2016,2017,2018,2019,2020,2021,2022,2023,2024,
+  2025
 ];
 // --- --- --- --- --- MÉTRICAS
 // --- --- --- MÉTRICAS HISTÓRICAS SOBRE O FOGO PRÉTERITO
-var fire = ee.Image('projects/mapbiomas-public/assets/brazil/fire/collection4_1/mapbiomas_fire_collection41_annual_burned_v1');
+var fire = ee.Image('projects/mapbiomas-public/assets/brazil/fire/collection5/mapbiomas_fire_collection5_annual_burned_v1');
 
 var features = features.map(function(feature){
   
@@ -280,7 +281,7 @@ print('features',features.first(),features.limit(3));
 print('+ MÉTRICAS DE KG/M² DOS COMPARTIMENTOS DE CARBONO', makeTableChart(features, features.first().propertyNames(), 'Fr_E_ID', 300));
 
 
-var description = '2026-06-26-fato-stats';
+var description = '2026-08-21-fato-stats';
 var folder = 'fire-fapesp';
 Export.table.toDrive({
   collection:features,
@@ -427,7 +428,10 @@ function getLandsat(year,month,day,point){
   
     2022: ['LC09', 'LC08'],
     2023: ['LC09', 'LC08'],
-    2024: ['LC09', 'LC08']
+    2024: ['LC09', 'LC08'],
+    2024: ['LC09', 'LC08'],
+    2025: ['LC09', 'LC08']
+
   };
   
   var constelations = yearToConstelation[year];
@@ -629,7 +633,7 @@ function getLandsat(year,month,day,point){
 
 function getCoverageMapBiomas(levelsRequested) {
 
-  var coverage = ee.Image('projects/mapbiomas-public/assets/brazil/lulc/collection10/mapbiomas_brazil_collection10_coverage_v2');
+  var coverage = ee.Image('projects/mapbiomas-public/assets/brazil/lulc/collection11/mapbiomas_brazil_collection11_coverage_v3');
 
   // Dicionário de legendas por nível
   var legend_coverage = {

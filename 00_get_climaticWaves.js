@@ -69,8 +69,8 @@ var END_DATE   = '2025-12-31';
 // filterDate() uses an exclusive ending date, therefore 2021-01-01.
 //
 
-var CLIM_START = '1985-01-01';
-var CLIM_END   = '2025-01-01';
+var CLIM_START = '1991-01-01';
+var CLIM_END   = '2020-01-01';
 
 
 // ---------------------------------------------------------------------------

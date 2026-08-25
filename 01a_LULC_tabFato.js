@@ -1,4 +1,3 @@
-
 var asset = 'users/dh-conciani/help/fire-fapesp/2026-08-21-fire-fapesp-fato';
 var features = ee.FeatureCollection(asset);
 
@@ -104,125 +103,283 @@ print('features',features.first(),features.limit(3));
 print('+ MÉTRICAS DA COBERTURA DA VIZINHANÇA', makeTableChart(features, features.first().propertyNames(), 'Fr_E_ID', 300));
 
 // --- --- --- MÉTRICAS DE CLIMA
-// Temp. média Max (mês) °C
-// Temp. média Min (mês) °C
-// Temp. Média do Mês (°c)
-// Temp. Média do Dia (°c)
-// Temp. Min do Dia (°C)
-// Temp. Max do Dia (°C)	
+// REIMPLEMENTED USING THE SIMPLE PER-FEATURE LOGIC OF THE ORIGINAL SCRIPT.
+//
+// Kept:
+// - 30-day temperature median/min/max before reference date
+// - reference-day temperature median/min/max
+// - precipitation in previous 7 days, 3 months and 1 year
+// - consecutive dry days immediately before reference date
+// - precipitation in the complete reference calendar year (Jan 1-Dec 31)
+// - mean annual precipitation for 1991-2020
+//
+// Removed:
+// - all heat-wave calculations
+// - all cold-wave/cold-front calculations
+//
+// IMPORTANT:
+// ERA5-Land temperature is sampled at its native ~11.1 km scale.
+// ERA5-Land total_precipitation_sum is in metres, so it is multiplied by 1000
+// before export to obtain millimetres.
 
-// Chuva Acumulada (12 meses)	
-// Chuva Acumulada (3 meses)	
-// Chuva Acumulada(1 semana)	
+var climateScale = 11132;
+var DRY_DAY_THRESHOLD_MM = 1.0;
+var DRY_LOOKBACK_YEARS = 10;
 
-// Temp.  <4 °C (12 meses)	Contagem de eventos de ondas de Calor (12 meses)	
-// Contagem de dias de onda de calor (12 meses) 	
+var hourly = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY');
+var daily = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR');
 
+// ---------------------------------------------------------------------------
+// BASIC HELPERS
+// ---------------------------------------------------------------------------
 
-// Precipitação Média Anual (mm)	// perguntar amanhã
-
-  // Temp. do ar no momento do fogo (°C)
-  // Vento no momento do fogo  (m/s)
-  // UR no momento do fogo (%)	
-// --- --- MÉTRICAS DE TEMPERATURA
-
-// ee.ImageCollection("ECMWF/ERA5/HOURLY")               // 27830 meters
-// ee.ImageCollection("ECMWF/ERA5/DAILY")                // 27830 meters
-// ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")      // 11132 meters
-// ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_BY_HOUR") // 11132 meters
-
-
-function select_temperature_celsius_by_horly (image){
-  return image.select('temperature_2m').subtract(273.15);
-}
-
-var hourly = ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY");          // 11132 meters
-var daily = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR"); // 11132 meters
-
-// print('temp_hourly',temp_hourly.first(),temp_hourly.limit(10),temp_hourly.first().bandNames());
-print('daily',daily.first(),daily.limit(10),daily.first().bandNames());
-
-// --- --- MÉTRICAS DE PRECIPITAÇAO
-function reduceRegion_first (image,geom){
+function select_temperature_celsius_by_hourly(image) {
   return image
-    .reduceRegion({
-      reducer:ee.Reducer.first(),
-      geometry:geom,
-      scale:scale, 
-      maxPixels:1e13, 
-    });
+    .select('temperature_2m')
+    .subtract(273.15)
+    .rename('temperature_2m');
 }
 
-var features = features.map(function(feature){
-  // var feature = features.first();
-  
+function reduceRegion_first_climate(image, geom) {
+  return image.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: geom,
+    scale: climateScale,
+    maxPixels: 1e13
+  });
+}
+
+// Correct server-side handling of Day == 'NA'.
+// The original JavaScript ternary with ee.String.equals() is unsafe because
+// Earth Engine objects cannot be evaluated as normal client-side booleans.
+function getClimatePointDate(feature) {
   var year = feature.getNumber('Yr_f_f_').int();
   var month = feature.getNumber('Month').int();
-  var day = feature.getString('Day'); day = day.equals('NA') ? '1' : day
+  var dayText = ee.String(feature.get('Day'));
 
-  var pointDate_day = ee.Date(ee.String('').cat(year).cat('-').cat(month).cat('-').cat(day));
-  var pointDate_month = ee.Date(ee.String('').cat(year).cat('-').cat(month).cat('-01'));
-  var pointDate_year = ee.Date(ee.String('').cat(year).cat('-01-01'));
-  
-  var temp_monthly_col = hourly.filterDate(pointDate_day.advance(-30,'days'),pointDate_day)
-      .map(select_temperature_celsius_by_horly)
-      .select('temperature_2m');
-  // var temp_monthly_col = temp_daily.filterDate(pointDate_day.advance(-15,'days'),pointDate_day.advance(15,'days'));
-  var temp_monthly_median = reduceRegion_first(temp_monthly_col.median(),feature.geometry()).get('temperature_2m');
-  var temp_monthly_min = reduceRegion_first(temp_monthly_col.min(),feature.geometry()).get('temperature_2m');
-  var temp_monthly_max = reduceRegion_first(temp_monthly_col.max(),feature.geometry()).get('temperature_2m');
+  var day = ee.Number(ee.Algorithms.If(
+    dayText.compareTo('NA').eq(0),
+    1,
+    ee.Number.parse(dayText)
+  )).int();
 
+  return ee.Date.fromYMD(year, month, day);
+}
 
-  var temp_daily_col = hourly.filterDate(pointDate_day,pointDate_day.advance(1,'days'))
-    .map(select_temperature_celsius_by_horly)
-    .select('temperature_2m');
-  var temp_daily_median = reduceRegion_first(temp_daily_col.median(),feature.geometry()).get('temperature_2m');
-  var temp_daily_min = reduceRegion_first(temp_daily_col.min(),feature.geometry()).get('temperature_2m');
-  var temp_daily_max = reduceRegion_first(temp_daily_col.max(),feature.geometry()).get('temperature_2m');
+// ---------------------------------------------------------------------------
+// PRECIPITATION COLLECTION IN MILLIMETRES
+// ---------------------------------------------------------------------------
 
-// Chuva Acumulada (12 meses)	
-// Chuva Acumulada (3 meses)	
-// Chuva Acumulada(1 semana)	
-
-  var precipitation_daily_col = daily.select('total_precipitation_sum');
-  var precipitation_1week = reduceRegion_first(precipitation_daily_col.filterDate(pointDate_day.advance(-7,'days'),pointDate_day).sum(),feature.geometry()).get('total_precipitation_sum');
-  var precipitation_3months = reduceRegion_first(precipitation_daily_col.filterDate(pointDate_day.advance(-3,'months'),pointDate_day).sum(),feature.geometry()).get('total_precipitation_sum');
-  var precipitation_1year = reduceRegion_first(precipitation_daily_col.filterDate(pointDate_day.advance(-1,'year'),pointDate_day).sum(),feature.geometry()).get('total_precipitation_sum');
-  
-  
-  ///////////////
-  var count_cold_fronts = reduceRegion_first(
-    daily
-      .filterDate(pointDate_day.advance(-1,'year'),pointDate_day)
-      .map(function select_temperature_celsius_by_horly (image){
-          return image.select('temperature_2m_min').subtract(273.15);
-        })
-      .map(function(image){return image.lte(4)})
-      .sum(),
-    feature.geometry()).get('temperature_2m_min');
-
-
-  //////////////
-  
-  feature = feature.set({
-    'temp-yearly_count_cold_fronts': count_cold_fronts,
-    'temp-monthly_median': temp_monthly_median,
-    'temp-monthly_min': temp_monthly_min,
-    'temp-monthly_max': temp_monthly_max,
-    'temp-daily_median': temp_daily_median,
-    'temp-daily_min': temp_daily_min,
-    'temp-daily_max': temp_daily_max,
-
-    'precipitation_1week':precipitation_1week,
-    'precipitation_3months':precipitation_3months,
-    'precipitation_1year':precipitation_1year,
-  });
-
-  return feature;
-  // print(feature);
+var precipitationDailyMM = daily.map(function(image) {
+  return image
+    .select('total_precipitation_sum')
+    .multiply(1000)
+    .max(0)
+    .rename('precip_mm')
+    .copyProperties(image, ['system:time_start']);
 });
-print('features',features.first(),features.limit(3));
-print('+ MÉTRICAS DE CLIMA', makeTableChart(features, features.first().propertyNames(), 'Fr_E_ID', 300));
+
+// ---------------------------------------------------------------------------
+// 1991-2020 MEAN ANNUAL PRECIPITATION
+// ---------------------------------------------------------------------------
+// Sum all daily precipitation in the complete 30-year climatological period
+// and divide by 30.
+//
+// This is exactly equivalent to:
+//   mean(annual total 1991, annual total 1992, ..., annual total 2020)
+// but avoids constructing a separate ImageCollection of 30 annual rasters.
+
+var meanAnnualPrecip1991_2020 = precipitationDailyMM
+  .filterDate('1991-01-01', '2021-01-01')
+  .sum()
+  .divide(30)
+  .rename('precip_mean_annual_1991_2020_mm');
+
+// ---------------------------------------------------------------------------
+// CONSECUTIVE DRY DAYS IMMEDIATELY BEFORE THE REFERENCE DATE
+// ---------------------------------------------------------------------------
+// Dry day: precipitation < 1 mm/day.
+// Reference day itself is excluded.
+//
+// Logic:
+// 1. Search backwards for wet days (>=1 mm).
+// 2. Convert each wet day to its timestamp.
+// 3. Take the latest wet-day timestamp.
+// 4. Difference between that date and the reference date minus one.
+//
+// No toBands(), arrays, heat-wave state machine, or collection-wide reducer.
+
+function consecutiveDryDaysBefore(feature, pointDate) {
+  var geom = feature.geometry();
+  var searchStart = pointDate.advance(-DRY_LOOKBACK_YEARS, 'year');
+
+  var lastWetDateImage = precipitationDailyMM
+    .filterDate(searchStart, pointDate)
+    .map(function(image) {
+      var wet = image.select('precip_mm').gte(DRY_DAY_THRESHOLD_MM);
+
+      return image
+        .select('precip_mm')
+        .multiply(0)
+        .add(image.date().millis())
+        .toDouble()
+        .rename('last_wet_millis')
+        .updateMask(wet);
+    })
+    .max();
+
+  var lastWetMillis = reduceRegion_first_climate(
+    lastWetDateImage,
+    geom
+  ).get('last_wet_millis');
+
+  return ee.Algorithms.If(
+    ee.Algorithms.IsEqual(lastWetMillis, null),
+    null,
+    pointDate
+      .difference(ee.Date(ee.Number(lastWetMillis)), 'day')
+      .subtract(1)
+      .max(0)
+  );
+}
+
+// ---------------------------------------------------------------------------
+// PER-FEATURE CLIMATE METRICS
+// ---------------------------------------------------------------------------
+// This deliberately follows the structure of the original/working script:
+// filter collection -> reduce time window to one image -> sample one point.
+
+features = features.map(function(feature) {
+
+  var geom = feature.geometry();
+  var pointDate = getClimatePointDate(feature);
+  var pointDateEnd = pointDate.advance(1, 'day');
+
+  var year = feature.getNumber('Yr_f_f_').int();
+  var calendarYearStart = ee.Date.fromYMD(year, 1, 1);
+  var calendarYearEnd = calendarYearStart.advance(1, 'year');
+
+  // -------------------------------------------------------------------------
+  // TEMPERATURE: PREVIOUS 30 DAYS
+  // -------------------------------------------------------------------------
+
+  var tempMonthlyCol = hourly
+    .filterDate(pointDate.advance(-30, 'day'), pointDate)
+    .map(select_temperature_celsius_by_hourly)
+    .select('temperature_2m');
+
+  var tempMonthlyMedian = reduceRegion_first_climate(
+    tempMonthlyCol.median(), geom
+  ).get('temperature_2m');
+
+  var tempMonthlyMin = reduceRegion_first_climate(
+    tempMonthlyCol.min(), geom
+  ).get('temperature_2m');
+
+  var tempMonthlyMax = reduceRegion_first_climate(
+    tempMonthlyCol.max(), geom
+  ).get('temperature_2m');
+
+  // -------------------------------------------------------------------------
+  // TEMPERATURE: REFERENCE DAY
+  // -------------------------------------------------------------------------
+
+  var tempDailyCol = hourly
+    .filterDate(pointDate, pointDateEnd)
+    .map(select_temperature_celsius_by_hourly)
+    .select('temperature_2m');
+
+  var tempDailyMedian = reduceRegion_first_climate(
+    tempDailyCol.median(), geom
+  ).get('temperature_2m');
+
+  var tempDailyMin = reduceRegion_first_climate(
+    tempDailyCol.min(), geom
+  ).get('temperature_2m');
+
+  var tempDailyMax = reduceRegion_first_climate(
+    tempDailyCol.max(), geom
+  ).get('temperature_2m');
+
+  // -------------------------------------------------------------------------
+  // PRECIPITATION BEFORE REFERENCE DATE
+  // -------------------------------------------------------------------------
+
+  var precipitation1Week = reduceRegion_first_climate(
+    precipitationDailyMM
+      .filterDate(pointDate.advance(-7, 'day'), pointDate)
+      .sum(),
+    geom
+  ).get('precip_mm');
+
+  var precipitation3Months = reduceRegion_first_climate(
+    precipitationDailyMM
+      .filterDate(pointDate.advance(-3, 'month'), pointDate)
+      .sum(),
+    geom
+  ).get('precip_mm');
+
+  var precipitation1Year = reduceRegion_first_climate(
+    precipitationDailyMM
+      .filterDate(pointDate.advance(-1, 'year'), pointDate)
+      .sum(),
+    geom
+  ).get('precip_mm');
+
+  // -------------------------------------------------------------------------
+  // COMPLETE CALENDAR-YEAR PRECIPITATION
+  // Jan 1 through Dec 31 of the reference year.
+  // -------------------------------------------------------------------------
+
+  var precipitationCalendarYear = reduceRegion_first_climate(
+    precipitationDailyMM
+      .filterDate(calendarYearStart, calendarYearEnd)
+      .sum(),
+    geom
+  ).get('precip_mm');
+
+  // -------------------------------------------------------------------------
+  // 1991-2020 CLIMATOLOGICAL MEAN ANNUAL PRECIPITATION
+  // -------------------------------------------------------------------------
+
+  var precipitationMeanAnnual = reduceRegion_first_climate(
+    meanAnnualPrecip1991_2020,
+    geom
+  ).get('precip_mean_annual_1991_2020_mm');
+
+  // -------------------------------------------------------------------------
+  // IMMEDIATELY PRECEDING DRY SPELL
+  // -------------------------------------------------------------------------
+
+  var dryDaysBefore = consecutiveDryDaysBefore(feature, pointDate);
+
+  return feature.set({
+    'temp-monthly_median': tempMonthlyMedian,
+    'temp-monthly_min': tempMonthlyMin,
+    'temp-monthly_max': tempMonthlyMax,
+
+    'temp-daily_median': tempDailyMedian,
+    'temp-daily_min': tempDailyMin,
+    'temp-daily_max': tempDailyMax,
+
+    // All precipitation values below are millimetres.
+    // Original property names are preserved for compatibility.
+    'precipitation_1week': precipitation1Week,
+    'precipitation_3months': precipitation3Months,
+    'precipitation_1year': precipitation1Year,
+
+    'precip-dry_days_before_reference': dryDaysBefore,
+    'precip-calendar_year_total_mm': precipitationCalendarYear,
+    'precip-mean_annual_1991_2020_mm': precipitationMeanAnnual
+  });
+});
+
+// Keep console evaluation small. The table is exported later to Drive.
+print(
+  'CLIMATE CHECK - first 3 features',
+  features.first(),
+  features.limit(3)
+);
 
 
 // --- --- --- MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL

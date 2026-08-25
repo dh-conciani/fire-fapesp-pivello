@@ -59,6 +59,7 @@ from datetime import datetime, timedelta, timezone
 
 
 # Use MapBiomas Brazil as the Earth Engine Cloud project.
+ee.Authenticate()
 ee.Initialize(project='mapbiomas-brazil')
 
 

@@ -102,25 +102,418 @@ var features = features.map(function(feature){
 print('features',features.first(),features.limit(3));
 print('+ MÉTRICAS DA COBERTURA DA VIZINHANÇA', makeTableChart(features, features.first().propertyNames(), 'Fr_E_ID', 300));
 
+// --- --- --- MÉTRICAS DE ACESSIBILIDADE / ANTROPIZAÇÃO
+// ============================================================================
+// DISTÂNCIA À ÁREA URBANIZADA + DENSIDADE DE ESTRADAS
+//
+// URBANO:
+// - MapBiomas Collection 11
+// - classe 24 = Área Urbanizada
+// - usa a classificação do MESMO ANO de Yr_f_f_
+// - distância Euclidiana calculada com ee.Image.distance()
+// - MapBiomas original = 30 m; grade operacional da distância = 120 m
+// - kernel Euclidiano limitado a 30 km
+// - se não houver classe 24 até 30 km:
+//       urban-distance_m = null
+//       urban-distance_gt30km = 1
+//       urban-distance_label = '>30 km'
+//
+// ESTRADAS:
+// - GRIP4 Central-South America
+// - rede viária estática (não anual)
+// - comprimento total de estradas dentro de buffer circular de 1 km
+// - densidade = km de estrada / km² de buffer
+//
+// As métricas são calculadas apenas para combinações únicas:
+// - urbano: localização + ano
+// - estrada: localização
+// e depois associadas novamente a todos os registros.
+// ============================================================================
+
+var accessibilityMapBiomas = ee.Image(
+  'projects/mapbiomas-public/assets/brazil/lulc/collection11/' +
+  'mapbiomas_brazil_collection11_coverage_v3'
+);
+
+var accessibilityRoadsGRIP4 = ee.FeatureCollection(
+  'projects/sat-io/open-datasets/GRIP4/Central-South-America'
+);
+
+var URBAN_CLASS = 24;
+var URBAN_SOURCE_SCALE_M = 30;
+var URBAN_DISTANCE_SCALE_M = 120; // operational grid for 30-km Euclidean kernel
+var URBAN_MAX_DISTANCE_M = 30000;  // 30 km
+
+var ROAD_BUFFER_M = 1000;
+
+// Kernel Euclidiano em metros.
+// ee.Image.distance() mascara pixels cuja distância excede o raio do kernel.
+// At 30 m, a 30-km radius would create a 2001-pixel-wide kernel,
+// exceeding Earth Engine's 512-pixel kernel limit.
+// At 120 m, the same 30-km radius is 250 pixels, i.e. 501 pixels wide.
+var urbanEuclideanKernel = ee.Kernel.euclidean(
+  URBAN_MAX_DISTANCE_M,
+  'meters'
+);
+
+
+// ---------------------------------------------------------------------------
+// CHAVES PARA EVITAR CÁLCULOS REPETIDOS
+// ---------------------------------------------------------------------------
+
+function addAccessibilityKeys(feature) {
+
+  var coords = ee.List(
+    feature.geometry().coordinates()
+  );
+
+  var lon = ee.Number(coords.get(0));
+  var lat = ee.Number(coords.get(1));
+  var year = feature.getNumber('Yr_f_f_').int();
+
+  var locationKey = lon.format('%.6f')
+    .cat('_')
+    .cat(lat.format('%.6f'));
+
+  var accessKey = locationKey
+    .cat('_')
+    .cat(year.format());
+
+  return feature.set({
+    '_access_location_key': locationKey,
+    '_access_year_key': accessKey
+  });
+}
+
+var featuresWithAccessibilityKeys = features.map(
+  addAccessibilityKeys
+);
+
+var uniqueAccessibilityLocationYears =
+  featuresWithAccessibilityKeys
+    .distinct(['_access_year_key']);
+
+var uniqueAccessibilityLocations =
+  featuresWithAccessibilityKeys
+    .distinct(['_access_location_key']);
+
+print(
+  'ACCESSIBILITY optimization: rows / unique location-year / unique locations',
+  featuresWithAccessibilityKeys.size(),
+  uniqueAccessibilityLocationYears.size(),
+  uniqueAccessibilityLocations.size()
+);
+
+
+// ---------------------------------------------------------------------------
+// 1) DISTÂNCIA EUCLIDIANA À CLASSE 24, LIMITADA A 30 KM
+// ---------------------------------------------------------------------------
+// Para cada ano:
+//   1. seleciona classification_<ano>
+//   2. cria máscara binária de classe 24
+//   3. calcula distância Euclidiana apenas até 30 km
+//   4. amostra somente os pontos daquele ano
+//
+// Não existe cálculo de distância além de 30 km.
+
+var accessibilityYears = ee.List(
+  uniqueAccessibilityLocationYears
+    .aggregate_array('Yr_f_f_')
+).distinct().sort();
+
+var urbanMetricsByYear = ee.FeatureCollection(
+  accessibilityYears.map(function(y) {
+
+    y = ee.Number(y).int();
+
+    var pointsThisYear =
+      uniqueAccessibilityLocationYears.filter(
+        ee.Filter.eq('Yr_f_f_', y)
+      );
+
+    var urbanMask30m = accessibilityMapBiomas
+      .select(
+        ee.String('classification_')
+          .cat(y.format())
+      )
+      .eq(URBAN_CLASS)
+      .unmask(0)
+      .rename('urban');
+
+    // Aggregate the original 30-m MapBiomas urban mask to 120 m.
+    // MAX preserves urban presence: if any 30-m class-24 pixel occurs
+    // inside the 120-m cell, that cell is treated as urban.
+    //
+    // This is necessary because a 30-km Euclidean kernel at 30 m would
+    // be 2001 pixels wide, above Earth Engine's 512-pixel kernel limit.
+    var urbanMask120m = urbanMask30m
+      .reduceResolution({
+        reducer: ee.Reducer.max(),
+        maxPixels: 64
+      })
+      .reproject({
+        crs: urbanMask30m.projection(),
+        scale: URBAN_DISTANCE_SCALE_M
+      })
+      .rename('urban');
+
+    // Euclidean distance is evaluated only up to 30 km.
+    // Pixels farther than 30 km remain masked.
+    var urbanDistance = urbanMask120m
+      .distance(
+        urbanEuclideanKernel,
+        false
+      )
+      .rename('urban-distance_m');
+
+    return pointsThisYear.map(function(feature) {
+
+      var d = urbanDistance.reduceRegion({
+        reducer: ee.Reducer.first(),
+        geometry: feature.geometry(),
+        scale: URBAN_DISTANCE_SCALE_M,
+        maxPixels: 1e8,
+        tileScale: 4
+      }).get('urban-distance_m');
+
+      var beyond30km = ee.Algorithms.IsEqual(
+        d,
+        null
+      );
+
+      return ee.Feature(null, {
+        '_access_year_key':
+          feature.get('_access_year_key'),
+
+        // Exact numeric distance only when an urban pixel occurs <=30 km.
+        'urban-distance_m':
+          ee.Algorithms.If(
+            beyond30km,
+            null,
+            d
+          ),
+
+        // Useful numeric censoring flag for statistical analysis.
+        'urban-distance_gt30km':
+          ee.Algorithms.If(
+            beyond30km,
+            1,
+            0
+          ),
+
+        // Human-readable output requested.
+        'urban-distance_label':
+          ee.Algorithms.If(
+            beyond30km,
+            '>30 km',
+            '<=30 km'
+          ),
+
+        // Metadata describing the operational distance calculation.
+        'urban-distance_resolution_m':
+          URBAN_DISTANCE_SCALE_M,
+
+        'urban-distance_method':
+          'MapBiomas class 24; Euclidean kernel <=30 km; 120 m operational grid'
+      });
+    });
+  })
+).flatten();
+
+print(
+  'URBAN DISTANCE CHECK',
+  urbanMetricsByYear.first(),
+  urbanMetricsByYear.limit(3)
+);
+
+
+// ---------------------------------------------------------------------------
+// 2) DENSIDADE DE ESTRADAS GRIP4 NO BUFFER DE 1 KM
+// ---------------------------------------------------------------------------
+// GRIP4 é estático. Portanto esta métrica NÃO varia com Yr_f_f_.
+//
+// Para cada localização única:
+//   - cria buffer circular de 1 km;
+//   - seleciona somente estradas que interceptam o buffer;
+//   - recorta cada linha ao buffer;
+//   - soma o comprimento em metros;
+//   - calcula km de estrada / km² de buffer.
+
+var roadMetricsUnique = uniqueAccessibilityLocations.map(
+  function(feature) {
+
+    var buffer = feature.geometry().buffer(
+      ROAD_BUFFER_M,
+      20
+    );
+
+    var localRoads = accessibilityRoadsGRIP4
+      .filterBounds(buffer);
+
+    var roadLengths = localRoads.map(
+      function(road) {
+
+        var clipped = ee.Feature(road)
+          .geometry()
+          .intersection(
+            buffer,
+            20
+          );
+
+        return ee.Feature(null, {
+          '_road_length_m':
+            clipped.length(20)
+        });
+      }
+    );
+
+    var totalRoadLengthM = ee.Number(
+      ee.Algorithms.If(
+        localRoads.size().gt(0),
+        roadLengths.aggregate_sum(
+          '_road_length_m'
+        ),
+        0
+      )
+    );
+
+    var bufferAreaKm2 = buffer
+      .area(20)
+      .divide(1e6);
+
+    var roadDensityKmPerKm2 =
+      totalRoadLengthM
+        .divide(1000)
+        .divide(bufferAreaKm2);
+
+    return ee.Feature(null, {
+      '_access_location_key':
+        feature.get('_access_location_key'),
+
+      'road-GRIP4_length_1km_m':
+        totalRoadLengthM,
+
+      'road-GRIP4_density_1km_km_per_km2':
+        roadDensityKmPerKm2
+    });
+  }
+);
+
+print(
+  'ROAD DENSITY CHECK',
+  roadMetricsUnique.first(),
+  roadMetricsUnique.limit(3)
+);
+
+
+// ---------------------------------------------------------------------------
+// 3) JOIN URBANO + ESTRADAS DE VOLTA A TODOS OS REGISTROS
+// ---------------------------------------------------------------------------
+
+// --- urbano: localização + ano
+var urbanJoin = ee.Join.saveFirst(
+  '_urban_match'
+);
+
+var featuresWithUrban = ee.FeatureCollection(
+  urbanJoin.apply(
+    featuresWithAccessibilityKeys,
+    urbanMetricsByYear,
+    ee.Filter.equals({
+      leftField: '_access_year_key',
+      rightField: '_access_year_key'
+    })
+  )
+).map(function(feature) {
+
+  feature = ee.Feature(feature);
+
+  var match = feature.get('_urban_match');
+
+  var urbanDict = ee.Dictionary(
+    ee.Algorithms.If(
+      ee.Algorithms.IsEqual(match, null),
+      ee.Dictionary({
+        'urban-distance_m': null,
+        'urban-distance_gt30km': null,
+        'urban-distance_label': null,
+        'urban-distance_resolution_m': null,
+        'urban-distance_method': null
+      }),
+      ee.Feature(match).toDictionary([
+        'urban-distance_m',
+        'urban-distance_gt30km',
+        'urban-distance_label',
+        'urban-distance_resolution_m',
+        'urban-distance_method'
+      ])
+    )
+  );
+
+  return feature.set(urbanDict);
+});
+
+
+// --- estradas: localização
+var roadJoinAccessibility = ee.Join.saveFirst(
+  '_road_match'
+);
+
+features = ee.FeatureCollection(
+  roadJoinAccessibility.apply(
+    featuresWithUrban,
+    roadMetricsUnique,
+    ee.Filter.equals({
+      leftField: '_access_location_key',
+      rightField: '_access_location_key'
+    })
+  )
+).map(function(feature) {
+
+  feature = ee.Feature(feature);
+
+  var match = feature.get('_road_match');
+
+  var roadDict = ee.Dictionary(
+    ee.Algorithms.If(
+      ee.Algorithms.IsEqual(match, null),
+      ee.Dictionary({
+        'road-GRIP4_length_1km_m': null,
+        'road-GRIP4_density_1km_km_per_km2': null
+      }),
+      ee.Feature(match).toDictionary([
+        'road-GRIP4_length_1km_m',
+        'road-GRIP4_density_1km_km_per_km2'
+      ])
+    )
+  );
+
+  var result = feature.set(roadDict);
+
+  // Remove propriedades internas usadas somente nos joins.
+  return result.select(
+    result.propertyNames()
+      .remove('_access_location_key')
+      .remove('_access_year_key')
+      .remove('_urban_match')
+      .remove('_road_match')
+  );
+});
+
+print(
+  'ACCESSIBILITY FINAL CHECK',
+  features.first(),
+  features.limit(3)
+);
+
+
+
 // --- --- --- MÉTRICAS DE CLIMA
-// REIMPLEMENTED USING THE SIMPLE PER-FEATURE LOGIC OF THE ORIGINAL SCRIPT.
-//
-// Kept:
-// - 30-day temperature median/min/max before reference date
-// - reference-day temperature median/min/max
-// - precipitation in previous 7 days, 3 months and 1 year
-// - consecutive dry days immediately before reference date
-// - precipitation in the complete reference calendar year (Jan 1-Dec 31)
-// - mean annual precipitation for 1991-2020
-//
-// Removed:
-// - all heat-wave calculations
-// - all cold-wave/cold-front calculations
-//
-// IMPORTANT:
-// ERA5-Land temperature is sampled at its native ~11.1 km scale.
-// ERA5-Land total_precipitation_sum is in metres, so it is multiplied by 1000
-// before export to obtain millimetres.
+// FAST VERSION:
+// 1) compute climate only once for each UNIQUE point + reference date;
+// 2) use ERA5-Land MONTHLY_AGGR for calendar-year and 1991-2020 precipitation;
+// 3) keep the exact 10-year search for the preceding dry spell;
+// 4) no heat-wave or cold-wave calculations.
 
 var climateScale = 11132;
 var DRY_DAY_THRESHOLD_MM = 1.0;
@@ -128,9 +521,10 @@ var DRY_LOOKBACK_YEARS = 10;
 
 var hourly = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY');
 var daily = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR');
+var monthly = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR');
 
 // ---------------------------------------------------------------------------
-// BASIC HELPERS
+// HELPERS
 // ---------------------------------------------------------------------------
 
 function select_temperature_celsius_by_hourly(image) {
@@ -149,9 +543,6 @@ function reduceRegion_first_climate(image, geom) {
   });
 }
 
-// Correct server-side handling of Day == 'NA'.
-// The original JavaScript ternary with ee.String.equals() is unsafe because
-// Earth Engine objects cannot be evaluated as normal client-side booleans.
 function getClimatePointDate(feature) {
   var year = feature.getNumber('Yr_f_f_').int();
   var month = feature.getNumber('Month').int();
@@ -167,7 +558,7 @@ function getClimatePointDate(feature) {
 }
 
 // ---------------------------------------------------------------------------
-// PRECIPITATION COLLECTION IN MILLIMETRES
+// PRECIPITATION IN MILLIMETRES
 // ---------------------------------------------------------------------------
 
 var precipitationDailyMM = daily.map(function(image) {
@@ -179,35 +570,62 @@ var precipitationDailyMM = daily.map(function(image) {
     .copyProperties(image, ['system:time_start']);
 });
 
-// ---------------------------------------------------------------------------
-// 1991-2020 MEAN ANNUAL PRECIPITATION
-// ---------------------------------------------------------------------------
-// Sum all daily precipitation in the complete 30-year climatological period
-// and divide by 30.
-//
-// This is exactly equivalent to:
-//   mean(annual total 1991, annual total 1992, ..., annual total 2020)
-// but avoids constructing a separate ImageCollection of 30 annual rasters.
+// MONTHLY_AGGR already contains the monthly sum of flow variables.
+// This is much cheaper for long climatological/calendar-year calculations.
+var precipitationMonthlyMM = monthly.map(function(image) {
+  return image
+    .select('total_precipitation_sum')
+    .multiply(1000)
+    .max(0)
+    .rename('precip_mm')
+    .copyProperties(image, ['system:time_start']);
+});
 
-var meanAnnualPrecip1991_2020 = precipitationDailyMM
+// 360 monthly images rather than ~10,958 daily images.
+var meanAnnualPrecip1991_2020 = precipitationMonthlyMM
   .filterDate('1991-01-01', '2021-01-01')
   .sum()
   .divide(30)
   .rename('precip_mean_annual_1991_2020_mm');
 
 // ---------------------------------------------------------------------------
-// CONSECUTIVE DRY DAYS IMMEDIATELY BEFORE THE REFERENCE DATE
+// ADD A CLIMATE KEY AND REMOVE DUPLICATE CLIMATE REQUESTS
 // ---------------------------------------------------------------------------
-// Dry day: precipitation < 1 mm/day.
-// Reference day itself is excluded.
+// Climate values depend only on:
+//   point geometry + reference date.
 //
-// Logic:
-// 1. Search backwards for wet days (>=1 mm).
-// 2. Convert each wet day to its timestamp.
-// 3. Take the latest wet-day timestamp.
-// 4. Difference between that date and the reference date minus one.
-//
-// No toBands(), arrays, heat-wave state machine, or collection-wide reducer.
+// Many rows in the source table have the same point/date. Compute those once
+// and join the resulting climate properties back to every original row.
+
+var featuresWithClimateKey = features.map(function(feature) {
+  var coords = ee.List(feature.geometry().coordinates());
+  var lon = ee.Number(coords.get(0));
+  var lat = ee.Number(coords.get(1));
+  var date = getClimatePointDate(feature);
+
+  var key = lon.format('%.6f')
+    .cat('_')
+    .cat(lat.format('%.6f'))
+    .cat('_')
+    .cat(date.format('YYYYMMdd'));
+
+  return feature.set('_climate_key', key);
+});
+
+var climateUniqueInput = featuresWithClimateKey
+  .distinct(['_climate_key']);
+
+print(
+  'CLIMATE optimization: original rows / unique point+date rows',
+  featuresWithClimateKey.size(),
+  climateUniqueInput.size()
+);
+
+// ---------------------------------------------------------------------------
+// CONSECUTIVE DRY DAYS IMMEDIATELY BEFORE REFERENCE DATE
+// ---------------------------------------------------------------------------
+// Exact configured lookback is retained: 10 years.
+// Only unique point/date combinations are evaluated.
 
 function consecutiveDryDaysBefore(feature, pointDate) {
   var geom = feature.geometry();
@@ -216,7 +634,8 @@ function consecutiveDryDaysBefore(feature, pointDate) {
   var lastWetDateImage = precipitationDailyMM
     .filterDate(searchStart, pointDate)
     .map(function(image) {
-      var wet = image.select('precip_mm').gte(DRY_DAY_THRESHOLD_MM);
+      var wet = image.select('precip_mm')
+        .gte(DRY_DAY_THRESHOLD_MM);
 
       return image
         .select('precip_mm')
@@ -244,12 +663,10 @@ function consecutiveDryDaysBefore(feature, pointDate) {
 }
 
 // ---------------------------------------------------------------------------
-// PER-FEATURE CLIMATE METRICS
+// COMPUTE CLIMATE ONLY FOR UNIQUE POINT + DATE COMBINATIONS
 // ---------------------------------------------------------------------------
-// This deliberately follows the structure of the original/working script:
-// filter collection -> reduce time window to one image -> sample one point.
 
-features = features.map(function(feature) {
+var climateComputed = climateUniqueInput.map(function(feature) {
 
   var geom = feature.geometry();
   var pointDate = getClimatePointDate(feature);
@@ -302,7 +719,7 @@ features = features.map(function(feature) {
   ).get('temperature_2m');
 
   // -------------------------------------------------------------------------
-  // PRECIPITATION BEFORE REFERENCE DATE
+  // ROLLING PRECIPITATION: exact daily windows
   // -------------------------------------------------------------------------
 
   var precipitation1Week = reduceRegion_first_climate(
@@ -327,19 +744,18 @@ features = features.map(function(feature) {
   ).get('precip_mm');
 
   // -------------------------------------------------------------------------
-  // COMPLETE CALENDAR-YEAR PRECIPITATION
-  // Jan 1 through Dec 31 of the reference year.
+  // COMPLETE CALENDAR YEAR: only 12 monthly images
   // -------------------------------------------------------------------------
 
   var precipitationCalendarYear = reduceRegion_first_climate(
-    precipitationDailyMM
+    precipitationMonthlyMM
       .filterDate(calendarYearStart, calendarYearEnd)
       .sum(),
     geom
   ).get('precip_mm');
 
   // -------------------------------------------------------------------------
-  // 1991-2020 CLIMATOLOGICAL MEAN ANNUAL PRECIPITATION
+  // 1991-2020 MEAN ANNUAL PRECIPITATION: 360 monthly images total
   // -------------------------------------------------------------------------
 
   var precipitationMeanAnnual = reduceRegion_first_climate(
@@ -347,11 +763,10 @@ features = features.map(function(feature) {
     geom
   ).get('precip_mean_annual_1991_2020_mm');
 
-  // -------------------------------------------------------------------------
-  // IMMEDIATELY PRECEDING DRY SPELL
-  // -------------------------------------------------------------------------
-
-  var dryDaysBefore = consecutiveDryDaysBefore(feature, pointDate);
+  var dryDaysBefore = consecutiveDryDaysBefore(
+    feature,
+    pointDate
+  );
 
   return feature.set({
     'temp-monthly_median': tempMonthlyMedian,
@@ -362,8 +777,6 @@ features = features.map(function(feature) {
     'temp-daily_min': tempDailyMin,
     'temp-daily_max': tempDailyMax,
 
-    // All precipitation values below are millimetres.
-    // Original property names are preserved for compatibility.
     'precipitation_1week': precipitation1Week,
     'precipitation_3months': precipitation3Months,
     'precipitation_1year': precipitation1Year,
@@ -374,12 +787,53 @@ features = features.map(function(feature) {
   });
 });
 
-// Keep console evaluation small. The table is exported later to Drive.
-print(
-  'CLIMATE CHECK - first 3 features',
-  features.first(),
-  features.limit(3)
-);
+// ---------------------------------------------------------------------------
+// JOIN CLIMATE METRICS BACK TO ALL ORIGINAL ROWS
+// ---------------------------------------------------------------------------
+
+var climateMetricNames = [
+  'temp-monthly_median',
+  'temp-monthly_min',
+  'temp-monthly_max',
+  'temp-daily_median',
+  'temp-daily_min',
+  'temp-daily_max',
+  'precipitation_1week',
+  'precipitation_3months',
+  'precipitation_1year',
+  'precip-dry_days_before_reference',
+  'precip-calendar_year_total_mm',
+  'precip-mean_annual_1991_2020_mm'
+];
+
+var climateJoin = ee.Join.saveFirst('climate_match');
+
+features = ee.FeatureCollection(
+  climateJoin.apply(
+    featuresWithClimateKey,
+    climateComputed,
+    ee.Filter.equals({
+      leftField: '_climate_key',
+      rightField: '_climate_key'
+    })
+  )
+).map(function(feature) {
+  var climateMatch = ee.Feature(feature.get('climate_match'));
+
+  var result = ee.Feature(feature).set(
+    climateMatch.toDictionary(climateMetricNames)
+  );
+
+  // Remove internal helper properties before final CSV export.
+  return result.select(
+    result.propertyNames()
+      .remove('climate_match')
+      .remove('_climate_key')
+  );
+});
+
+// Avoid forcing an extra full table/chart evaluation in the Console.
+print('CLIMATE CHECK - first feature', features.first());
 
 
 // --- --- --- MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL

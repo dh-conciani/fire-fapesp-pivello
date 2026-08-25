@@ -1261,8 +1261,10 @@ var fuelComputedList = years.map(function(year) {
           feature
         );
 
+      // Do NOT unmask here.
+      // If the Landsat composite has no valid observation at the point,
+      // the SMA value should remain null rather than being converted to 0.
       var fuelBands = landsatYearCollection
-        .unmask()
         .reduceRegion({
           reducer: ee.Reducer.first(),
           geometry: feature.geometry(),
@@ -1275,25 +1277,25 @@ var fuelComputedList = years.map(function(year) {
           feature.get('_fuel_key'),
 
         'SMA-npv':
-          fuelBands.getNumber('npv'),
+          fuelBands.get('npv'),
 
         'SMA-gv':
-          fuelBands.getNumber('gv'),
+          fuelBands.get('gv'),
 
         'SMA-soil':
-          fuelBands.getNumber('soil'),
+          fuelBands.get('soil'),
 
         'SMA-cloud':
-          fuelBands.getNumber('cloud'),
+          fuelBands.get('cloud'),
 
         'SMA-shade':
-          fuelBands.getNumber('shade'),
+          fuelBands.get('shade'),
 
         'SMA_gvs':
-          fuelBands.getNumber('gvs'),
+          fuelBands.get('gvs'),
 
         'SMA_npvSoil':
-          fuelBands.getNumber('npvSoil')
+          fuelBands.get('npvSoil')
       });
     });
 });
@@ -1367,7 +1369,7 @@ var features = qcn_kg_m2.reduceRegions({
   
 
 
-var description = '2026-08-25-fato-stats-FAST-v2-1';
+var description = '2026-08-25-fato-stats-FAST-v2-2';
 var folder = 'fire-fapesp';
 Export.table.toDrive({
   collection:features,
@@ -1533,17 +1535,44 @@ function getLandsat(year,month,day,point){
   });
   
   // Keep only the bands actually exported by the fuel block.
-  return images
-    .select([
-      'npv',
-      'gv',
-      'soil',
-      'cloud',
-      'shade',
-      'gvs',
-      'npvSoil'
+  var fuelBandNames = [
+    'npv',
+    'gv',
+    'soil',
+    'cloud',
+    'shade',
+    'gvs',
+    'npvSoil'
+  ];
+
+  var fuelImages = images.select(
+    fuelBandNames
+  );
+
+  // Robust fallback for an empty Landsat collection.
+  //
+  // An empty ImageCollection reduced with median() can produce an image
+  // with zero bands. Later operations then fail because the expected SMA
+  // schema no longer exists.
+  //
+  // Add one fully masked 7-band image. It contributes no valid pixels when
+  // real Landsat observations exist, but guarantees that the median image
+  // always has the expected seven band names.
+  var emptyFuelImage = ee.Image.constant([
+      0, 0, 0, 0, 0, 0, 0
     ])
-    .median();
+    .rename(fuelBandNames)
+    .updateMask(
+      ee.Image.constant(0)
+    );
+
+  fuelImages = fuelImages.merge(
+    ee.ImageCollection([
+      emptyFuelImage
+    ])
+  );
+
+  return fuelImages.median();
   
   
   // -------------------------------------------------------------------

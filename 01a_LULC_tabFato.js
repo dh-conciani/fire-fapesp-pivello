@@ -1,4 +1,13 @@
-var asset = 'users/dh-conciani/help/fire-fapesp/2026-08-21-fire-fapesp-fato';
+// FIRE-FAPESP: FULL-PRODUCTION SINGLE CSV EXPORT
+// ALL years 1985-2025, ALL source fire records, ALL original metric branches.
+// NO testing limits, NO row partitions, NO separate branch exports.
+// Optimized heatwaves use temporal max reductions instead of per-point toBands
+// and 3,650-step lists. Console prints/charts disabled for export.
+// IMPORTANT: One-task exports can still time out. Earth Engine run NOT verified.
+// Source: 2026-10-15 fire FAPESP code from user.
+//============================================================================
+
+var asset = 'users/dh-conciani/help/fire-fapesp/2026-10-15-fire-fapesp-fato';
 
 // Keep a lightweight immutable source collection.
 // Every expensive metric branch is derived from this source independently.
@@ -8,15 +17,16 @@ var features = sourceFeatures;
 
 var columns = [
   'Day',
-  'Fr_C_ID',
+  'Fir_Typ',
   'Fr_E_ID',
   'Month',
   'Site',
   'Yr_f_f_'
 ];
 
-var chart = makeTableChart(features, columns, 'Fr_C_ID', 300);
-print('TABELA CRUA', chart);
+// Console table disabled for production.
+// Console diagnostic disabled in full-production export.
+
 
 // --- --- --- AUXILIAR
 var scale = 30;
@@ -74,11 +84,8 @@ var featuresWithLocationYearKey = features.map(addLocationYearKey);
 var uniqueLocationYearsFast = featuresWithLocationYearKey
   .distinct(['_location_year_key_fast']);
 
-print(
-  'FAST fire/coverage: original rows / unique location-year',
-  featuresWithLocationYearKey.size(),
-  uniqueLocationYearsFast.size()
-);
+// Console diagnostic disabled in full-production export.
+
 
 
 // ---------------------------------------------------------------------------
@@ -378,10 +385,8 @@ features = ee.FeatureCollection(
   );
 });
 
-print(
-  'FAST FIRE + COVERAGE CHECK',
-  features.first()
-);
+// Console diagnostic disabled in full-production export.
+
 
 
 
@@ -486,12 +491,8 @@ var featuresWithAccessibilityKeys = features.map(
   addAccessibilityKeys
 );
 
-print(
-  'ACCESSIBILITY optimization: rows / unique location-year / unique locations',
-  sourceFeatures.size(),
-  uniqueAccessibilityLocationYears.size(),
-  uniqueAccessibilityLocations.size()
-);
+// Console diagnostic disabled in full-production export.
+
 
 
 // ---------------------------------------------------------------------------
@@ -609,11 +610,8 @@ var urbanMetricsByYear = ee.FeatureCollection(
   })
 ).flatten();
 
-print(
-  'URBAN DISTANCE CHECK',
-  urbanMetricsByYear.first(),
-  urbanMetricsByYear.limit(3)
-);
+// Console diagnostic disabled in full-production export.
+
 
 
 // ---------------------------------------------------------------------------
@@ -688,11 +686,8 @@ var roadMetricsUnique = uniqueAccessibilityLocations.map(
   }
 );
 
-print(
-  'ROAD DENSITY CHECK',
-  roadMetricsUnique.first(),
-  roadMetricsUnique.limit(3)
-);
+// Console diagnostic disabled in full-production export.
+
 
 
 // ---------------------------------------------------------------------------
@@ -789,11 +784,8 @@ features = ee.FeatureCollection(
   );
 });
 
-print(
-  'ACCESSIBILITY BRANCH CHECK',
-  urbanMetricsByYear.first(),
-  roadMetricsUnique.first()
-);
+// Console diagnostic disabled in full-production export.
+
 
 
 
@@ -802,7 +794,7 @@ print(
 // 1) compute climate only once for each UNIQUE point + reference date;
 // 2) use ERA5-Land MONTHLY_AGGR for calendar-year and 1991-2020 precipitation;
 // 3) keep the exact 10-year search for the preceding dry spell;
-// 4) no heat-wave or cold-wave calculations.
+// 4) heatwaves are calculated separately from the supplied daily binary dataset.
 
 var climateScale = 11132;
 var DRY_DAY_THRESHOLD_MM = 1.0;
@@ -914,11 +906,8 @@ var featuresWithClimateKey = features.map(
   addClimateKey
 );
 
-print(
-  'CLIMATE optimization: original rows / unique point+date rows',
-  sourceFeatures.size(),
-  climateUniqueInput.size()
-);
+// Console diagnostic disabled in full-production export.
+
 
 // ---------------------------------------------------------------------------
 // CONSECUTIVE DRY DAYS IMMEDIATELY BEFORE REFERENCE DATE
@@ -1147,8 +1136,241 @@ features = ee.FeatureCollection(
 });
 
 // Avoid forcing an extra full table/chart evaluation in the Console.
-print('CLIMATE BRANCH CHECK', climateComputed.first());
+// Console diagnostic disabled in full-production export.
 
+
+
+// --- --- --- HEATWAVES: PRODUCTION, FULL DATASET (no per-point time stack)
+// ============================================================================
+// Definition is already embedded in the daily binary MapBiomas asset:
+// TX90, 1991-2020 climatology, 5-day centered window, >=6 consecutive days.
+// This implementation never builds a 3,650-band image or iterates through
+// a 10-year daily list for every fire. Instead, temporal ImageCollection
+// maximum reductions identify the most recent completed run, and a short
+// count verifies the inferred run has no missing daily heat-wave pixels.
+// It keeps the same ten-year lookback, 90-day boundary pad, and output names.
+// 'Last' means most recent COMPLETED wave, excluding waves ongoing on fire day.
+// All records and all years are processed together in one Export.table task.
+// ============================================================================
+var HEATWAVE_ASSET =
+  'projects/mapbiomas-brazil/assets/DEGRADATION/COLLECTION-11/' +
+  'CLIMATIC_WAVES/heatWaves_v2';
+var HEATWAVE_LOOKBACK_YEARS = 10;
+var HEATWAVE_BOUNDARY_PAD_DAYS = 90;
+var HEATWAVE_EARLIEST_DATE = ee.Date('1985-01-01');
+var HEATWAVE_SCALE_M = 11132;
+var HEATWAVE_MS_PER_DAY = 86400000;
+var HEATWAVE_MIN_DURATION = 6;
+
+// Build date-index bands, preserving the source pixel projection.
+// Earth Engine's 'date' asset metadata is a YYYY-MM-dd string.
+var heatwaveTaggedDays = ee.ImageCollection(HEATWAVE_ASSET)
+  .select('heat_wave')
+  .map(function(image) {
+    image = ee.Image(image);
+    var binary = image.select('heat_wave');
+    var dayIndex = ee.Date(ee.String(image.get('date')))
+      .millis().divide(HEATWAVE_MS_PER_DAY).round();
+    var dayImage = binary.multiply(0).add(dayIndex).toInt();
+    return ee.Image.cat([
+      dayImage.updateMask(binary.eq(1)).rename('heat_day'),
+      dayImage.updateMask(binary.eq(0)).rename('normal_day'),
+      dayImage.updateMask(binary.gte(0).and(binary.lte(1)))
+        .rename('observed_day')
+    ]).copyProperties(image, ['date']);
+  });
+
+function hwMaxDateImage(collection, bandNames) {
+  // A fully masked fallback preserves band schema for empty date windows.
+  var fallback = ee.Image.constant(
+    bandNames.map(function() { return -1; })
+  ).rename(bandNames).updateMask(ee.Image.constant(0));
+  return collection.select(bandNames)
+    .merge(ee.ImageCollection([fallback])).max();
+}
+
+function hwDate(dayIndex) {
+  return ee.Date(ee.Number(dayIndex).multiply(HEATWAVE_MS_PER_DAY));
+}
+
+function hwNumOrMinusOne(x) {
+  return ee.Number(ee.Algorithms.If(
+    ee.Algorithms.IsEqual(x, null), -1, x
+  ));
+}
+
+function hwSample(image, geometry) {
+  return image.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: geometry,
+    scale: HEATWAVE_SCALE_M,
+    maxPixels: 1e8,
+    tileScale: 4
+  });
+}
+
+function hwMaxDate(a, b) {
+  return ee.Date(ee.Algorithms.If(
+    ee.Date(a).millis().gte(ee.Date(b).millis()), a, b
+  ));
+}
+
+function heatwaveMetricsAtFire(feature) {
+  feature = ee.Feature(feature);
+  var geom = feature.geometry();
+  var focalDate = getClimatePointDate(feature);
+  var focalDay = focalDate.millis().divide(HEATWAVE_MS_PER_DAY).round();
+  var cutoff = hwMaxDate(
+    HEATWAVE_EARLIEST_DATE,
+    focalDate.advance(-HEATWAVE_LOOKBACK_YEARS, 'year')
+  );
+  var readStart = hwMaxDate(
+    HEATWAVE_EARLIEST_DATE,
+    cutoff.advance(-HEATWAVE_BOUNDARY_PAD_DAYS, 'day')
+  );
+  var startText = readStart.format('YYYY-MM-dd');
+  var focalText = focalDate.format('YYYY-MM-dd');
+  var startDay = readStart.millis().divide(HEATWAVE_MS_PER_DAY).round();
+  var cutoffDay = cutoff.millis().divide(HEATWAVE_MS_PER_DAY).round();
+
+  // One raster reduction retrieves both most recent 1, most recent 0,
+  // and most recent observed daily pixel on or before fire day.
+  var beforeFire = heatwaveTaggedDays
+    .filter(ee.Filter.gte('date', startText))
+    .filter(ee.Filter.lte('date', focalText));
+  var latest = hwSample(hwMaxDateImage(beforeFire, [
+    'heat_day', 'normal_day', 'observed_day'
+  ]), geom);
+  var lastOne = hwNumOrMinusOne(latest.get('heat_day'));
+  var lastZero = hwNumOrMinusOne(latest.get('normal_day'));
+  var lastObserved = hwNumOrMinusOne(latest.get('observed_day'));
+  var focalObserved = lastObserved.eq(focalDay);
+  var focalBinary = ee.Algorithms.If(
+    focalObserved,
+    ee.Algorithms.If(lastOne.eq(focalDay), 1, 0),
+    null
+  );
+
+  // A wave is completed iff an observed normal day comes after its end.
+  // If the fire is inside an ongoing wave, ignore that current run: find
+  // the latest wave day BEFORE the last observed zero.
+  var safeLastZero = lastZero.max(startDay);
+  var oldHeatDay = hwNumOrMinusOne(hwSample(
+    hwMaxDateImage(
+      heatwaveTaggedDays
+        .filter(ee.Filter.gte('date', startText))
+        .filter(ee.Filter.lt('date', hwDate(safeLastZero).format('YYYY-MM-dd'))),
+      ['heat_day']
+    ), geom
+  ).get('heat_day'));
+  var lastCompletedEnd = ee.Number(ee.Algorithms.If(
+    lastOne.gte(0).and(lastZero.gt(lastOne)),
+    lastOne,
+    oldHeatDay
+  ));
+
+  // Previous observed normal day is the day before the start of a run.
+  var safeEnd = lastCompletedEnd.max(startDay);
+  var previousNormal = hwNumOrMinusOne(hwSample(
+    hwMaxDateImage(
+      heatwaveTaggedDays
+        .filter(ee.Filter.gte('date', startText))
+        .filter(ee.Filter.lt('date', hwDate(safeEnd).format('YYYY-MM-dd'))),
+      ['normal_day']
+    ), geom
+  ).get('normal_day'));
+  var duration = lastCompletedEnd.subtract(previousNormal);
+
+  // Cheap boundary verification around the candidate event:
+  //   (a) all interior calendar days must be observed heatwave=1;
+  //   (b) the day immediately after the end must be observed 0.
+  // Missing days are NOT silently interpreted as zeros.
+  var safePreviousNormal = previousNormal.max(startDay.subtract(1));
+  var eventDays = heatwaveTaggedDays
+    .filter(ee.Filter.gt('date', hwDate(safePreviousNormal).format('YYYY-MM-dd')))
+    .filter(ee.Filter.lte('date', hwDate(safeEnd).format('YYYY-MM-dd')));
+  var fallbackHeatBand = ee.Image.constant(-1)
+    .rename('heat_day').updateMask(ee.Image.constant(0));
+  var eventDayCount = eventDays.select('heat_day')
+    .merge(ee.ImageCollection([fallbackHeatBand]))
+    .count().rename('heat_count');
+  var afterDate = hwDate(safeEnd.add(1)).format('YYYY-MM-dd');
+  var nextNormal = hwMaxDateImage(
+    heatwaveTaggedDays.filter(ee.Filter.eq('date', afterDate)),
+    ['normal_day']
+  );
+  var checked = hwSample(ee.Image.cat([eventDayCount, nextNormal]), geom);
+  var nObservedHeatDays = hwNumOrMinusOne(checked.get('heat_count'));
+  var nextZeroDay = hwNumOrMinusOne(checked.get('normal_day'));
+
+  var found = focalObserved
+    .and(lastCompletedEnd.gte(cutoffDay))
+    .and(previousNormal.gte(startDay))
+    .and(duration.gte(HEATWAVE_MIN_DURATION))
+    .and(nObservedHeatDays.eq(duration))
+    .and(nextZeroDay.eq(lastCompletedEnd.add(1)));
+
+  return ee.Feature(null, {
+    '_heatwave_key': feature.get('_heatwave_key'),
+    'Days_since_heatwave': ee.Algorithms.If(
+      found, focalDay.subtract(lastCompletedEnd), null
+    ),
+    'Heatwave_duration': ee.Algorithms.If(found, duration, null),
+    'heatwave_last_start': ee.Algorithms.If(
+      found, hwDate(previousNormal.add(1)).format('YYYY-MM-dd'), null
+    ),
+    'heatwave_last_end': ee.Algorithms.If(
+      found, hwDate(lastCompletedEnd).format('YYYY-MM-dd'), null
+    ),
+    'heatwave_reference_day_binary': focalBinary,
+    'heatwave_reference_day_observed': ee.Number(focalObserved),
+    'heatwave_lookback_years': HEATWAVE_LOOKBACK_YEARS
+  });
+}
+
+// Deduplicate identical point/date combinations, matching climate keys.
+function addHeatwaveKey(feature) {
+  feature = ee.Feature(feature);
+  return feature.set(
+    '_heatwave_key', addClimateKey(feature).get('_climate_key')
+  );
+}
+var heatwaveInput = sourceFeatures.map(addHeatwaveKey);
+var heatwaveUniqueInput = heatwaveInput.distinct(['_heatwave_key']);
+var heatwaveComputed = heatwaveUniqueInput.map(heatwaveMetricsAtFire);
+var heatwaveMetricNames = [
+  'Days_since_heatwave',
+  'Heatwave_duration',
+  'heatwave_last_start',
+  'heatwave_last_end',
+  'heatwave_reference_day_binary',
+  'heatwave_reference_day_observed',
+  'heatwave_lookback_years'
+];
+
+var featuresWithHeatwaveKey = features.map(addHeatwaveKey);
+var heatwaveJoin = ee.Join.saveFirst('_heatwave_match');
+features = ee.FeatureCollection(heatwaveJoin.apply(
+  featuresWithHeatwaveKey,
+  heatwaveComputed,
+  ee.Filter.equals({
+    leftField: '_heatwave_key', rightField: '_heatwave_key'
+  })
+)).map(function(feature) {
+  feature = ee.Feature(feature);
+  var hwProps = ee.Feature(feature.get('_heatwave_match'))
+    .toDictionary(heatwaveMetricNames);
+  var enriched = feature.set(hwProps);
+  return enriched.select(
+    enriched.propertyNames()
+      .remove('_heatwave_key')
+      .remove('_heatwave_match')
+  );
+});
+
+// ============================================================================
+// END HEATWAVES
+// ============================================================================
 
 // --- --- --- MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL
 // ============================================================================
@@ -1215,11 +1437,8 @@ var featuresWithFuelKey = features.map(
   addFuelKey
 );
 
-print(
-  'FAST fuel: original rows / unique point-date',
-  sourceFeatures.size(),
-  fuelUniqueInput.size()
-);
+// Console diagnostic disabled in full-production export.
+
 
 // getLandsat() requires year as a client-side JS number because it chooses
 // the Landsat constellation from a JavaScript dictionary.
@@ -1348,10 +1567,8 @@ features = ee.FeatureCollection(
   );
 });
 
-print(
-  'FAST FUEL BRANCH CHECK',
-  fuelComputed.first()
-);
+// Console diagnostic disabled in full-production export.
+
 
 
 
@@ -1369,7 +1586,7 @@ var features = qcn_kg_m2.reduceRegions({
   
 
 
-var description = '2026-08-25-fato-stats-FAST-v2-2';
+var description = '2026-10-15-tabFato-stats';
 var folder = 'fire-fapesp';
 Export.table.toDrive({
   collection:features,
@@ -1512,7 +1729,6 @@ function getLandsat(year,month,day,point){
   
     2022: ['LC09', 'LC08'],
     2023: ['LC09', 'LC08'],
-    2024: ['LC09', 'LC08'],
     2024: ['LC09', 'LC08'],
     2025: ['LC09', 'LC08']
 

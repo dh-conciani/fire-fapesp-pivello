@@ -1,42 +1,43 @@
-"""MAPBIOMAS BRAZIL — HEATWAVE MONTHLY + ANNUAL EXPORTS (NATIONAL V1.2)
+"""MAPBIOMAS BRAZIL — HEATWAVE AGGREGATION (NATIONAL, THROUGH AUG 2026)
 
-Input 1: .../CLIMATIC_WAVES/heatWaves_v2  -> .../heatWaves_v2_agg
-Input 2: .../CLIMATIC_WAVES/heatWaves     -> .../heatWaves_agg
-Years: 1985–2025, all 12 months plus annual, all Brazil in FULL mode.
+ONLY input: .../CLIMATIC_WAVES/heatWaves_v2
+ONLY output: .../CLIMATIC_WAVES/heatWaves_v2_agg
+FULL mode, all Brazil:
+  - 1985–2025: January–December MONTHLY + ANNUAL rasters.
+  - 2026: January–August MONTHLY rasters only (through 2026-08-31 UTC).
+  - NO 2026 annual raster; NO September–December 2026 rasters.
 
-Four indicators: heatwave_days, event_count, max_event_duration,
-mean_event_duration. Plus qc_censored_event (1 = do NOT interpret event metrics).
+Indicators: heatwave_days, event_count, max_event_duration,
+mean_event_duration, plus qc_censored_event (1 = event metrics are masked).
 
-MapBiomas calendar convention:
-  * Allocate heatwave days to the UTC dates on which they occurred.
-  * Allocate each WHOLE event to the UTC date on which it ENDED.
+Calendar convention:
+  * Heatwave days belong to the UTC dates on which they occurred.
+  * A WHOLE heatwave event belongs to the UTC date on which it ENDED.
   * Never split an event at a month or year boundary.
-  * No completed events: event_count=0, max/mean masked.
+  * No completed events: event_count=0; max/mean masked.
   * Unknown incoming event start: mask all event metrics in its end period.
-  * The day AFTER period end is needed to close an event on its final day.
-  * Yearly results reconcile exactly with the 12 monthly source metrics.
+  * A day AFTER the final period is necessary to confirm events ending on
+    its final day. For August 2026, Sep 1 is OPTIONAL: when absent, hot
+    pixels on Aug 31 receive qc_censored_event=1 for August event metrics;
+    the August heatwave-day total is still complete.
+  * Full-year annual raw metrics derive from exactly 12 monthly raw metrics.
 
-Computational design:
-  1. Check source date inventories, source band, and common target grid.
-  2. For each source and year, export ONE 60-band whole-Brazil staging image
-     (12 months x five raw metrics) using ONE event scan; there are no tiles.
-  3. Read the national staging image to export 12 monthly + one annual
-     five-band final products, avoiding 13 independent event-history scans.
-  4. Skip existing assets; resume/wait for active exports; retry failures.
+Execution:
+  1. Check the v2 daily date inventory and schema; use the native v2 grid.
+  2. One national staging image per year: 60 bands for full years,
+     40 bands for Jan–Aug 2026. No geographic tiling.
+  3. Export monthly finals for every year and annual finals ONLY through 2025.
+  4. Reuse existing valid asset IDs, resume active tasks, retry failures.
 
-FULL is selected by default to match the requested 1985-2025 exports.
-Strongly consider changing to PILOT first: PILOT processes the entire Brazil
-geometry for 2023 and writes to dedicated *_agg_NATIONAL_PILOT collections.
-
-This script includes a fix for empty 1985 lookback windows. The 2023 national
-pilot was run by the user; full historical exports still require validation.
+FULL is default. PILOT processes one entire-Brazil year in dedicated pilot
+assets; set PILOT_YEAR=2026 to test the eight-month partial-year pathway.
+The original 1985 empty-lookback safeguard remains in place.
 """
 
 from __future__ import annotations
 
 import csv
 import datetime as dt
-import json
 import math
 import time
 from collections import Counter
@@ -48,28 +49,26 @@ import ee
 EE_PROJECT = 'mapbiomas-brazil'
 ROOT = 'projects/mapbiomas-brazil/assets/DEGRADATION/COLLECTION-11/CLIMATIC_WAVES'
 
-SOURCES = [  # Process in exactly this order, not simultaneously.
-    {'label': 'v2', 'input': ROOT + '/heatWaves_v2',
-     'output': ROOT + '/heatWaves_v2_agg', 'band': 'heat_wave', 'positive_value': 1},
-    {'label': 'v1', 'input': ROOT + '/heatWaves',
-     'output': ROOT + '/heatWaves_agg', 'band': None, 'positive_value': 1},
-]
+SOURCE = {'label': 'v2', 'input': ROOT + '/heatWaves_v2',
+          'output': ROOT + '/heatWaves_v2_agg',
+          'band': 'heat_wave', 'positive_value': 1}
 
-RUN_MODE = 'FULL'         # 'FULL' (1985-2025) or 'PILOT' (one year); BOTH cover ALL BRAZIL.
-PILOT_YEAR = 2023        # Use RUN_MODE='PILOT' to try one NATIONAL year first.
-START_YEAR = 1985
-END_YEAR = 2025
+RUN_MODE = 'FULL'       # 'FULL' or 'PILOT'; both use the WHOLE-BRAZIL geometry.
+PILOT_YEAR = 2026       # Set RUN_MODE='PILOT' to test the partial 2026 path.
+START_YEAR = 1985       # Set START_YEAR=2026 to run only 2026 in FULL mode.
+END_YEAR = 2026
+PARTIAL_YEAR = 2026
+PARTIAL_LAST_MONTH = 8  # 2026 ends at AUGUST 31 (inclusive).
 
-SPEC_VERSION = 1         # Increment if calculations/definitions change.
-TASK_PREFIX = 'Dhemerson_Atmosfera_'  # Earth Engine task description ONLY; never asset/file names.
+SPEC_VERSION = 1        # Retain historical asset IDs / existing m1 exports.
+TASK_PREFIX = 'Dhemerson_Atmosfera_'  # Task description only, NOT output asset names.
 FIRST_SOURCE_DATE = dt.date(1985, 1, 1)
-LOOKBACK_DAYS = 366      # Earlier run onset must be observable or QC flags it.
-REQUIRE_NEXT_JAN1 = True    # In FULL, requires Jan 1, 2026 to close Dec 2025.
-                              # In PILOT, requires Jan 1 after PILOT_YEAR.
+LOOKBACK_DAYS = 366     # Incoming event onset: long runs may be QC flagged.
+REQUIRE_NEXT_JAN1 = True      # Full years: require their following Jan 1.
+REQUIRE_PARTIAL_NEXT_DAY = False  # Sep 1, 2026 optional; mask ambiguous Aug events.
 
-# COMMON GRID: export both versions on the projection and exact pixel origin
-# of v2's first daily binary image. No invented fine-resolution pixels.
-REFERENCE_SOURCE = SOURCES[0]['input']
+# Output on the v2 input grid (projection and exact pixel origin).
+REFERENCE_SOURCE = SOURCE['input']
 REFERENCE_BAND = 'heat_wave'
 
 # Time controls / restart safety. Avoid flooding the EE project queue.
@@ -96,6 +95,7 @@ except Exception:
 
 assert RUN_MODE in ('PILOT', 'FULL')
 assert START_YEAR <= END_YEAR
+assert PARTIAL_YEAR == 2026 and PARTIAL_LAST_MONTH == 8
 assert LOOKBACK_DAYS >= 1
 
 BRAZIL = (ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
@@ -103,6 +103,22 @@ BRAZIL = (ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
           .first().geometry())
 RUN_YEARS = ([PILOT_YEAR] if RUN_MODE == 'PILOT'
              else list(range(START_YEAR, END_YEAR + 1)))
+
+
+def is_partial_year(year):
+    return year == PARTIAL_YEAR
+
+
+def months_for_year(year):
+    """2026: Jan-Aug; all other years: Jan-Dec."""
+    last_month = PARTIAL_LAST_MONTH if is_partial_year(year) else 12
+    return list(range(1, last_month + 1))
+
+
+def last_day_for_year(year):
+    """Inclusive last processed UTC date (2026-08-31 for 2026)."""
+    last_month = months_for_year(year)[-1]
+    return month_boundaries(year, last_month)[1] - dt.timedelta(days=1)
 
 
 def iso(d):
@@ -123,7 +139,7 @@ def date_range(first, last_inclusive):
 
 
 def configure_source(source):
-    """Source schema may differ; never silently select an arbitrary V1 band."""
+    """Prepare the heatWaves_v2 source and staging collection."""
     src = dict(source)
     if RUN_MODE == 'PILOT':
         # Different from the older small-region pilot; never reuse its assets.
@@ -142,21 +158,11 @@ def configure_source(source):
     bands = first_image.bandNames().getInfo()
     if not bands:
         raise RuntimeError(f"No first daily source image: {src['input']} on {lookback0}")
-    if src['band'] is None:
-        if 'heat_wave' in bands:
-            src['band'] = 'heat_wave'
-        elif len(bands) == 1:
-            src['band'] = bands[0]
-        else:
-            raise RuntimeError(
-                f"V1 has multiple bands {bands}. Set SOURCES[1]['band'] explicitly.")
-        print(f"[{src['label']}] Automatically selected band: {src['band']!r}")
     if src['band'] not in bands:
         raise RuntimeError(f"[{src['label']}] Expected band {src['band']!r}, found {bands}")
     src['raw'] = collection
 
-    # The output grid is identical for both sources, even if their native
-    # input pixel grids differ. Old binary source uses nearest-neighbor sampling.
+    # Keep input and output grids aligned to heatWaves_v2.
     return src
 
 
@@ -172,21 +178,26 @@ def common_projection():
 
 
 def check_dates(source):
-    """Fail closed if required daily images are absent or duplicated.
+    """Fail on missing/duplicate required daily images; detect closing sentinel.
 
-    For FULL, check all 1985-2025 dates, plus 2026-01-01 for closing 2025.
-    For PILOT, check exactly the requested year, 366-day lookback and one
-    post-year day. No missing day may be interpreted as a zero.
+    FULL: require 1985-01-01 through 2026-08-31 inclusive (unless START_YEAR
+    was moved forward); allow 2026-09-01 to be missing and QC-mask uncertain
+    August events. Full years always need a next-day observation to close
+    their Dec 31 events when REQUIRE_NEXT_JAN1 is True.
+
+    PILOT: check its lookback, all requested months, and optional next day
+    (mandatory when testing a full year and REQUIRE_NEXT_JAN1 is True).
     """
     first = max(FIRST_SOURCE_DATE,
                 dt.date(min(RUN_YEARS), 1, 1) - dt.timedelta(days=LOOKBACK_DAYS))
-    last_day = dt.date(max(RUN_YEARS), 12, 31)
+    last_day = last_day_for_year(max(RUN_YEARS))
     sentinel = last_day + dt.timedelta(days=1)
-    end_exclusive = sentinel + dt.timedelta(days=1)
+    end_exclusive = sentinel + dt.timedelta(days=1)  # Include sentinel if present.
     milliseconds = (source['raw'].filterDate(iso(first), iso(end_exclusive))
                     .aggregate_array('system:time_start').getInfo())
     if not isinstance(milliseconds, list):
         raise RuntimeError(f"[{source['label']}] Could not read date metadata")
+
     observed = []
     off_midnight = []
     for value in milliseconds:
@@ -196,27 +207,38 @@ def check_dates(source):
         if stamp.time() != dt.time(0, 0):
             off_midnight.append(stamp.isoformat())
         observed.append(stamp.date())
+
     duplicates = [(d, n) for d, n in Counter(observed).items() if n > 1]
     obs_set = set(observed)
     missing = sorted(set(date_range(first, last_day)) - obs_set)
     has_sentinel = sentinel in obs_set
-    if off_midnight or duplicates or missing or (REQUIRE_NEXT_JAN1 and not has_sentinel):
+    mandatory_sentinel = (REQUIRE_PARTIAL_NEXT_DAY if is_partial_year(max(RUN_YEARS))
+                          else REQUIRE_NEXT_JAN1)
+    if off_midnight or duplicates or missing or (mandatory_sentinel and not has_sentinel):
         raise RuntimeError(
             f"[{source['label']}] DATE PREFLIGHT FAILED. "
+            f"Required dates {first}..{last_day} UTC. "
             f"Missing ({len(missing)}): {missing[:20]}; "
             f"duplicates ({len(duplicates)}): {duplicates[:10]}; "
             f"off-midnight: {off_midnight[:5]}; "
-            f"last-day sentinel {sentinel}: {has_sentinel}. "
-            "Repair the source or set REQUIRE_NEXT_JAN1=False only if "
-            "you accept QC-masked final-period event metrics.")
-    print(f"[{source['label']}] PASS: {len(observed)} daily assets; "
-          f"{first}..{last_day}; sentinel {sentinel}={has_sentinel}")
-    source['final_sentinel'] = has_sentinel
+            f"next-day sentinel {sentinel}: {has_sentinel} "
+            f"(mandatory={mandatory_sentinel}). "
+            "Missing required days must not be interpreted as heatwave-free days.")
+
+    # For FULL, all dates before the final partial year are contiguous, so
+    # January 1 is present for each earlier full year's December 31 closure.
+    source['observed_dates'] = obs_set
+    print(f"[{source['label']}] PASS: {len(observed)} daily images; "
+          f"required range {first}..{last_day}; "
+          f"closing-day observation {sentinel}={has_sentinel}")
+    if is_partial_year(max(RUN_YEARS)) and not has_sentinel:
+        print(f"[{source['label']}] NOTE: 2026-08-31 hot pixels will have "
+              "qc_censored_event=1 in August; August day counts remain valid.")
     return has_sentinel
 
 
 # =========================== 3. RASTER ALGORITHM ===========================
-MONTHS = list(range(1, 13))
+MONTHS = list(range(1, 13))  # Only used for annual (1985–2025) reductions.
 RAW_KEYS = ('days', 'events', 'duration_sum', 'max', 'qc')
 
 
@@ -233,18 +255,21 @@ def binary_collection(source, first, end_exclusive):
 
 
 def make_stage_image(source, year, include_next_day):
-    """Return 60 *raw* monthly bands for one year over all Brazil.
+    """One 60-band full-year OR 40-band Jan–Aug 2026 national staging image.
 
-    A single stateful scan tracks runs over the lookback and year. Event-end
-    contribution images are timestamped on the event's last 1-day (yesterday,
-    when the current day's 0 proves the preceding run has finished). Annual
-    final products are calculated by combining these exact monthly bands.
+    The image's scan includes the lookback and requested months. An optional
+    observation on the NEXT day identifies completed events ending on the
+    last date of the requested interval (e.g., Sep 1 closes Aug 31).
+    Event-end records are timestamped on the LAST hot day, not on the first
+    non-hot day; annual finals, when applicable, sum these monthly metrics.
     """
     year_start = dt.date(year, 1, 1)
-    next_year = dt.date(year + 1, 1, 1)
+    last_day = last_day_for_year(year)
+    period_end_exclusive = last_day + dt.timedelta(days=1)
     context_start = max(FIRST_SOURCE_DATE,
                         year_start - dt.timedelta(days=LOOKBACK_DAYS))
-    read_until = next_year + dt.timedelta(days=1) if include_next_day else next_year
+    read_until = (period_end_exclusive + dt.timedelta(days=1)
+                  if include_next_day else period_end_exclusive)
     col = binary_collection(source, context_start, read_until)
 
     # Reference zero inherits the *source* grid inside the temporal scan;
@@ -285,8 +310,9 @@ def make_stage_image(source, year, include_next_day):
         'records': ee.List([]),
     })
 
-    # Jan 1 NEXT year closes an event ending Dec 31 of THIS year. An event
-    # still active Jan 1 does NOT end in December and is NOT counted then.
+    # A next-day non-hot observation confirms an event ended on the last
+    # processed day (Jan 1 after Dec 31, or Sep 1 after Aug 31, 2026).
+    # A run still hot on that next day does not count as a completed event.
     target = col.filterDate(iso(year_start), iso(read_until)).sort('system:time_start')
 
     def record_event_end(image, state):
@@ -319,12 +345,13 @@ def make_stage_image(source, year, include_next_day):
 
     final = ee.Dictionary(target.iterate(record_event_end, state0))
     ends = ee.ImageCollection.fromImages(ee.List(final.get('records')))
-    # With no 2026 Jan 1 asset, a 2025 Dec 31 hot day could be an unconfirmed
-    # December event end. Mask ONLY Dec and annual event metrics at those pixels.
+    # Without the post-period observation, hot pixels on the final day
+    # could represent incomplete events: flag ONLY the last processed month.
     right_uncertain = (zero if include_next_day else ee.Image(final.get('prev')))
 
+    processed_months = months_for_year(year)
     raw_bands = []
-    for month in MONTHS:
+    for month in processed_months:
         start, stop = month_boundaries(year, month)
         m = f'm{month:02d}'
         source_days = col.filterDate(iso(start), iso(stop)).select('hw')
@@ -335,7 +362,7 @@ def make_stage_image(source, year, include_next_day):
                         .unmask(0).toInt32())
         maximum = monthly_end_records.select('max').max().unmask(0).toInt32()
         qc = monthly_end_records.select('qc').max().unmask(0).toInt32()
-        if month == 12:
+        if month == processed_months[-1]:
             qc = qc.Or(right_uncertain).toInt32()
         raw_bands.extend([
             days,
@@ -355,32 +382,44 @@ def make_stage_image(source, year, include_next_day):
         'aggregation_stage': True,
         'processing_layout': 'single_nationwide_stage',
         'left_lookback_days': LOOKBACK_DAYS,
-        'includes_next_year_jan_01': include_next_day,
+        'processed_through_utc': iso(last_day),
+        'months_in_stage': len(processed_months),
+        'partial_year': is_partial_year(year),
+        'includes_day_after_processed_period': include_next_day,
         'method': 'day_by_calendar_date_complete_event_by_utc_end_date',
         'run_mode': RUN_MODE,
     })
 
 
 def stage_id(source, year):
-    return f"{source['staging']}/staging_{year}_BRAZIL_m{SPEC_VERSION}"
+    # Distinct partial-stage ID avoids accidentally reusing an old 60-band
+    # 2026 staging raster from the previous script. Historic IDs are unchanged.
+    partial = f'_JAN_AUG' if is_partial_year(year) else ''
+    return f"{source['staging']}/staging_{year}{partial}_BRAZIL_m{SPEC_VERSION}"
 
 
 def final_id(source, year, month=None):
     if month is None:
+        if is_partial_year(year):
+            raise ValueError('No annual 2026 raster: only Jan-Aug monthly exports')
         name = f'annual_{year}_m{SPEC_VERSION}'
     else:
+        if month not in months_for_year(year):
+            raise ValueError(f'Month {month} is not included in year {year}')
         name = f'monthly_{year}_{month:02d}_m{SPEC_VERSION}'
     return source['output'] + '/' + name
 
 
 def staged_year_image(source, year):
-    """Load the one materialized, full-Brazil 60-band annual staging image."""
+    """Load the full-Brazil staged image (60 bands, or 40 for 2026)."""
     return ee.Image(stage_id(source, year))
 
 
 def finalize_raw(raw, year, month, source):
-    """Calculate public monthly or annual 4 indicators plus 1 QA band."""
+    """Calculate public monthly or (only through 2025) annual indicators."""
     if month is None:
+        if is_partial_year(year):
+            raise ValueError('Annual output is not defined for partial year 2026')
         days = ee.ImageCollection.fromImages([
             raw.select(f'm{m:02d}_days').rename('value') for m in MONTHS]).sum()
         events = ee.ImageCollection.fromImages([
@@ -421,6 +460,8 @@ def finalize_raw(raw, year, month, source):
         'period_type': period,
         'period_start_utc': iso(date0),
         'period_end_exclusive_utc': iso(date1),
+        'source_data_through_utc': iso(last_day_for_year(year)),
+        'partial_year': is_partial_year(year),
         'source_collection': source['input'],
         'source_band': source['band'],
         'source_heatwave_value': source['positive_value'],
@@ -640,11 +681,17 @@ def export_options():
 
 
 def stage_jobs(source, year):
-    """Exactly ONE national staging task per source/year; no mosaics/tiles."""
-    sentinel = True if year < max(RUN_YEARS) or source['final_sentinel'] else False
+    """Exactly one national stage (2026=Jan-Aug only), no mosaics/tiles."""
+    next_day = last_day_for_year(year) + dt.timedelta(days=1)
+    sentinel = next_day in source['observed_dates']
+    if not sentinel and (REQUIRE_PARTIAL_NEXT_DAY if is_partial_year(year)
+                         else REQUIRE_NEXT_JAN1):
+        raise RuntimeError(
+            f"[{source['label']}] Required {next_day} image to close {year} events")
     aid = stage_id(source, year)
+    period_tag = 'JAN_AUG_' if is_partial_year(year) else ''
     desc = (f'{TASK_PREFIX}MBHW_S{SPEC_VERSION}_'
-            f'{source["label"]}_{year}_BRAZIL_{RUN_MODE}')
+            f'{source["label"]}_{year}_{period_tag}BRAZIL_{RUN_MODE}')
 
     def make_task(aid=aid, desc=desc, year=year,
                   source=source, sentinel=sentinel):
@@ -654,7 +701,8 @@ def stage_jobs(source, year):
             region=BRAZIL, crs=GRID['crs'], crsTransform=GRID['crsTransform'],
             maxPixels=1e13,
             pyramidingPolicy={'.default': 'mean',
-                              **{f'm{m:02d}_qc': 'max' for m in MONTHS}},
+                              **{f'm{m:02d}_qc': 'max'
+                                 for m in months_for_year(year)}},
         )
 
     return [{'source': source['label'], 'year': year,
@@ -664,7 +712,11 @@ def stage_jobs(source, year):
 
 def final_jobs(source, year):
     jobs = []
-    for month in [*MONTHS, None]:
+    # Absolutely no 2026 annual (None) or Sep-Dec monthly tasks.
+    periods = months_for_year(year)
+    if not is_partial_year(year):
+        periods = [*periods, None]
+    for month in periods:
         aid = final_id(source, year, month)
         period = f'month_{month:02d}' if month else 'annual'
         desc = f'{TASK_PREFIX}MBHW_F{SPEC_VERSION}_{source["label"]}_{year}_{period}_{RUN_MODE}'
@@ -690,42 +742,41 @@ def main():
     print('=' * 74)
     print('MapBiomas heatwave aggregates', RUN_MODE, 'spec v' + str(SPEC_VERSION))
     print('Years:', RUN_YEARS[0], '..', RUN_YEARS[-1],
-          '| monthly + annual | ONE NATIONAL stage per year (NO PARTITIONS)')
-    print('2 sources: v2 FIRST, then original heatWaves')
+          '| 1985-2025: monthly + annual; 2026: Jan-Aug monthly ONLY')
+    print('Partial 2026 data end: 2026-08-31 inclusive (UTC)')
+    print('Only source: heatWaves_v2 (original heatWaves is NOT accessed)')
     print('Input data are never overwritten; all outputs have versioned names.')
     print('=' * 74)
 
-    # Check BOTH input sources before exporting ANYTHING.
-    sources = [configure_source(s) for s in SOURCES]
-    for s in sources:
-        check_dates(s)
+    # Check ONLY the v2 input collection before exporting anything.
+    src = configure_source(SOURCE)
+    check_dates(src)
 
     global GRID
     GRID = common_projection()
-    count_expected = len(RUN_YEARS) * (12 + 1) * len(sources)
+    count_expected = sum(len(months_for_year(y)) +
+                         (0 if is_partial_year(y) else 1) for y in RUN_YEARS)
     print('Expected FINAL rasters:', count_expected,
-          '| reusable NATIONAL stages:', len(RUN_YEARS) * len(sources))
+          '| reusable NATIONAL stages:', len(RUN_YEARS))
     print('PILOT (if chosen) ALSO covers entire Brazil; it uses separate assets.')
 
-    for src in sources:  # sequential: V2 fully first, then V1
-        ensure_collection(src['staging'])
-        ensure_collection(src['output'])
-        print('\n' + '=' * 30, src['label'], '=' * 30)
-        for iy, year in enumerate(RUN_YEARS, 1):
-            print(f'[{src["label"]}] YEAR {year} ({iy}/{len(RUN_YEARS)})')
-            finals = final_jobs(src, year)
-            if all(asset_exists(j['asset_id']) for j in finals):
-                print('  All 13 final images already exist; skipping this year.')
-                continue
-            stages = stage_jobs(src, year)
-            print('  A. Materializing ONE national staging image ...')
-            run_tasks_in_batches(stages, MAX_STAGE_CONCURRENT)
-            if not asset_exists(stages[0]['asset_id']):
-                raise RuntimeError('Cannot export final images: national stage is absent')
-            print('  B. Exporting 12 monthly + 1 annual image (ALL BRAZIL) ...')
-            run_tasks_in_batches(finals, MAX_FINAL_CONCURRENT)
-            print(f'  DONE {src["label"]} {year}')
-        print('SOURCE FINISHED:', src['label'], src['output'])
+    ensure_collection(src['staging'])
+    ensure_collection(src['output'])
+    for iy, year in enumerate(RUN_YEARS, 1):
+        print(f'[{src["label"]}] YEAR {year} ({iy}/{len(RUN_YEARS)})')
+        finals = final_jobs(src, year)
+        if all(asset_exists(j['asset_id']) for j in finals):
+            print(f'  All {len(finals)} final images already exist; skipping year.')
+            continue
+        stages = stage_jobs(src, year)
+        print('  A. Materializing ONE national staging image ...')
+        run_tasks_in_batches(stages, MAX_STAGE_CONCURRENT)
+        if not asset_exists(stages[0]['asset_id']):
+            raise RuntimeError('Cannot export final images: national stage is absent')
+        print(f'  B. Exporting {len(finals)} final images (ALL BRAZIL) ...')
+        run_tasks_in_batches(finals, MAX_FINAL_CONCURRENT)
+        print(f'  DONE {src["label"]} {year}')
+    print('SOURCE FINISHED:', src['label'], src['output'])
 
     print('\nFINISHED: all requested final assets verified as existing.')
     print('Run log:', REPORT_PATH)

@@ -7,7 +7,7 @@
 // Source: 2026-10-15 fire FAPESP code from user.
 //============================================================================
 
-var asset = 'users/dh-conciani/help/fire-fapesp/2026-10-15-fire-fapesp-fato';
+var asset = 'users/dh-conciani/help/fire-fapesp/2026-11-11-fire-fapesp-fato';
 
 // Keep a lightweight immutable source collection.
 // Every expensive metric branch is derived from this source independently.
@@ -1586,7 +1586,7 @@ var features = qcn_kg_m2.reduceRegions({
   
 
 
-var description = '2026-10-15-tabFato-stats';
+var description = '2026-11-11-tabFato-stats';
 var folder = 'fire-fapesp';
 Export.table.toDrive({
   collection:features,

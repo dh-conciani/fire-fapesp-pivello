@@ -12,7 +12,106 @@ var asset = 'users/dh-conciani/help/fire-fapesp/2026-11-11-fire-fapesp-fato';
 // Keep a lightweight immutable source collection.
 // Every expensive metric branch is derived from this source independently.
 // Results are joined only after the branch-specific calculations.
-var sourceFeatures = ee.FeatureCollection(asset);
+// PATCH 2026-11-17 (v2): Validate date fields BEFORE Number.parse().
+// Source year/month/day may be numeric, numeric text, null, or 'NA'.
+// Records with unresolvable dates are NOT dropped from the final CSV.
+// Their date-dependent metrics remain empty; static roads and QCN carbon
+// are still computed. No arbitrary replacement year/month is used for metrics.
+
+var sourceFeaturesRaw = ee.FeatureCollection(asset);
+
+function sourceFieldText(feature, field) {
+  var value = ee.Feature(feature).get(field);
+  return ee.String(ee.Algorithms.If(
+    ee.Algorithms.IsEqual(value, null), '', value
+  )).trim();
+}
+
+// Accept 1985, '1985', '1985.0', etc., but not 'NA' or empty strings.
+// IMPORTANT: replace invalid text with a NUMERIC STRING before parsing;
+// do not call Number.parse('NA') in either branch of a conditional.
+function isIntegerText(text) {
+  return ee.String(text).match('^[0-9]+(\\.0+)?$').size().gt(0);
+}
+
+function safeIntegerFromText(text, fallbackText) {
+  var safeText = ee.String(ee.Algorithms.If(
+    isIntegerText(text), text, fallbackText
+  ));
+  return ee.Number.parse(safeText).int();
+}
+
+// Preserve original convention: Day='NA'/missing -> day 1.
+// All other malformed days are marked invalid in classifySourceDate().
+function getSourceDay(feature) {
+  return safeIntegerFromText(sourceFieldText(feature, 'Day'), '1');
+}
+
+function getSourceInteger(feature, field) {
+  // Used only on validated, normalized sourceFeatures.
+  return ee.Number(ee.Feature(feature).get(field)).int();
+}
+
+function classifySourceDate(feature) {
+  feature = ee.Feature(feature);
+  var yearText = sourceFieldText(feature, 'Yr_f_f_');
+  var monthText = sourceFieldText(feature, 'Month');
+  var dayText = sourceFieldText(feature, 'Day');
+
+  // Fallbacks are used ONLY to make validation safe. Any record failing
+  // validation goes to undatedSourceFeatures, not into raster time series.
+  var year = safeIntegerFromText(yearText, '2000');
+  var month = safeIntegerFromText(monthText, '1');
+  var day = safeIntegerFromText(dayText, '1');
+  var allowedMissingDay = dayText.compareTo('').eq(0).or(
+    dayText.match('^NA$', 'i').size().gt(0)
+  );
+  var yearOK = isIntegerText(yearText)
+    .and(year.gte(1985)).and(year.lte(2025));
+  var monthOK = isIntegerText(monthText)
+    .and(month.gte(1)).and(month.lte(12));
+  var dayOK = allowedMissingDay.or(
+    isIntegerText(dayText).and(day.gte(1)).and(day.lte(31))
+  );
+  var valid = yearOK.and(monthOK).and(dayOK);
+
+  return feature.set({
+    '_fire_fapesp_date_valid': ee.Algorithms.If(valid, 1, 0),
+    '_fire_fapesp_year_num': year,
+    '_fire_fapesp_month_num': month
+  });
+}
+
+var dateAuditedSourceFeatures = sourceFeaturesRaw.map(classifySourceDate);
+
+// Valid rows have canonical numeric year/month for year-based filtering,
+// while original Day (including 'NA') is preserved in the output.
+var sourceFeatures = dateAuditedSourceFeatures
+  .filter(ee.Filter.eq('_fire_fapesp_date_valid', 1))
+  .map(function(feature) {
+    feature = ee.Feature(feature);
+    var result = feature.set({
+      'Yr_f_f_': feature.get('_fire_fapesp_year_num'),
+      'Month': feature.get('_fire_fapesp_month_num')
+    });
+    return result.select(result.propertyNames()
+      .remove('_fire_fapesp_date_valid')
+      .remove('_fire_fapesp_year_num')
+      .remove('_fire_fapesp_month_num'));
+  });
+
+// Keep every invalid-date source record, retaining its ORIGINAL values.
+var undatedSourceFeatures = dateAuditedSourceFeatures
+  .filter(ee.Filter.eq('_fire_fapesp_date_valid', 0))
+  .map(function(feature) {
+    feature = ee.Feature(feature);
+    return feature.select(feature.propertyNames()
+      .remove('_fire_fapesp_date_valid')
+      .remove('_fire_fapesp_year_num')
+      .remove('_fire_fapesp_month_num'));
+  });
+
+// Everything below this point uses only valid dates until the final merge.
 var features = sourceFeatures;
 
 var columns = [
@@ -63,7 +162,7 @@ function addLocationYearKey(feature) {
   var coords = ee.List(feature.geometry().coordinates());
   var lon = ee.Number(coords.get(0));
   var lat = ee.Number(coords.get(1));
-  var year = feature.getNumber('Yr_f_f_').int();
+  var year = getSourceInteger(feature, 'Yr_f_f_');
 
   var locationKey = lon.format('%.6f')
     .cat('_')
@@ -102,7 +201,7 @@ var fireMetricsUnique = uniqueLocationYearsFast.map(function(feature) {
   });
 
   var stopIndex = ee.List(years)
-    .indexOf(feature.getNumber('Yr_f_f_').add(1));
+    .indexOf(getSourceInteger(feature, 'Yr_f_f_').add(1));
 
   var values = frequencyHistogram.values()
     .slice(0, stopIndex);
@@ -195,7 +294,7 @@ var coverageLevel2Values = [
 
 var coverageMetricsUnique = uniqueLocationYearsFast.map(function(feature) {
 
-  var year = feature.getNumber('Yr_f_f_').int();
+  var year = getSourceInteger(feature, 'Yr_f_f_');
   var buffer = feature.geometry().buffer(1000);
 
   var coverageYear = mapbiomasCoverageRaw
@@ -457,7 +556,7 @@ function addAccessibilityKeys(feature) {
 
   var lon = ee.Number(coords.get(0));
   var lat = ee.Number(coords.get(1));
-  var year = feature.getNumber('Yr_f_f_').int();
+  var year = getSourceInteger(feature, 'Yr_f_f_');
 
   var locationKey = lon.format('%.6f')
     .cat('_')
@@ -482,9 +581,20 @@ var uniqueAccessibilityLocationYears =
   accessibilityInput
     .distinct(['_access_year_key']);
 
-var uniqueAccessibilityLocations =
-  accessibilityInput
-    .distinct(['_access_location_key']);
+// Road density is date-independent. Include locations whose year/month
+// are missing or 'NA' so those records also get the static road metric.
+function addRoadLocationKey(feature) {
+  feature = ee.Feature(feature);
+  var coords = ee.List(feature.geometry().coordinates());
+  var locationKey = ee.Number(coords.get(0)).format('%.6f')
+    .cat('_')
+    .cat(ee.Number(coords.get(1)).format('%.6f'));
+  return feature.set('_access_location_key', locationKey);
+}
+
+var uniqueAccessibilityLocations = sourceFeaturesRaw
+  .map(addRoadLocationKey)
+  .distinct(['_access_location_key']);
 
 // Add the same keys to the already-enriched output only for the final joins.
 var featuresWithAccessibilityKeys = features.map(
@@ -825,15 +935,9 @@ function reduceRegion_first_climate(image, geom) {
 }
 
 function getClimatePointDate(feature) {
-  var year = feature.getNumber('Yr_f_f_').int();
-  var month = feature.getNumber('Month').int();
-  var dayText = ee.String(feature.get('Day'));
-
-  var day = ee.Number(ee.Algorithms.If(
-    dayText.compareTo('NA').eq(0),
-    1,
-    ee.Number.parse(dayText)
-  )).int();
+  var year = getSourceInteger(feature, 'Yr_f_f_');
+  var month = getSourceInteger(feature, 'Month');
+  var day = getSourceDay(feature);
 
   return ee.Date.fromYMD(year, month, day);
 }
@@ -960,7 +1064,7 @@ var climateComputed = climateUniqueInput.map(function(feature) {
   var pointDate = getClimatePointDate(feature);
   var pointDateEnd = pointDate.advance(1, 'day');
 
-  var year = feature.getNumber('Yr_f_f_').int();
+  var year = getSourceInteger(feature, 'Yr_f_f_');
   var calendarYearStart = ee.Date.fromYMD(year, 1, 1);
   var calendarYearEnd = calendarYearStart.advance(1, 'year');
 
@@ -1383,17 +1487,9 @@ features = ee.FeatureCollection(heatwaveJoin.apply(
 // ============================================================================
 
 function getFuelDate(feature) {
-  var year = feature.getNumber('Yr_f_f_').int();
-  var month = feature.getNumber('Month').int();
-  var dayText = ee.String(feature.get('Day'));
-
-  var day = ee.Number(
-    ee.Algorithms.If(
-      dayText.compareTo('NA').eq(0),
-      1,
-      ee.Number.parse(dayText)
-    )
-  ).int();
+  var year = getSourceInteger(feature, 'Yr_f_f_');
+  var month = getSourceInteger(feature, 'Month');
+  var day = getSourceDay(feature);
 
   return ee.Date.fromYMD(
     year,
@@ -1454,23 +1550,9 @@ var fuelComputedList = years.map(function(year) {
     )
     .map(function(feature) {
 
-      var month = feature
-        .getNumber('Month')
-        .int();
+      var month = getSourceInteger(feature, 'Month');
 
-      var dayText = ee.String(
-        feature.get('Day')
-      );
-
-      // Parse day as an integer. ee.String(number) may yield values such as
-      // '3.0', which are invalid when manually concatenated into a date string.
-      var day = ee.Number(
-        ee.Algorithms.If(
-          dayText.compareTo('NA').eq(0),
-          1,
-          ee.Number.parse(dayText)
-        )
-      ).int();
+      var day = getSourceDay(feature);
 
       var landsatYearCollection =
         getLandsat(
@@ -1576,6 +1658,40 @@ features = ee.FeatureCollection(
 
 var qcn_kg_m2 = ee.Image('projects/ee-ipam/assets/CCAL/public/qcn/qcn_brazil_historical_biomass_carbon_qcn_rect_v1')
   .select(['TOTAL','AGB','BGB','CDW','LITTER'],['QCN-total','QCN-agb','QCN-bgb','QCN-cdw','QCN-litter']).divide(10);
+// Append date-invalid rows without inventing date-dependent values.
+// They receive static GRIP4 road metrics and QCN carbon below.
+var undatedWithRoads = ee.FeatureCollection(
+  roadJoinAccessibility.apply(
+    undatedSourceFeatures.map(addRoadLocationKey),
+    roadMetricsUnique,
+    ee.Filter.equals({
+      leftField: '_access_location_key',
+      rightField: '_access_location_key'
+    })
+  )
+).map(function(feature) {
+  feature = ee.Feature(feature);
+  var match = feature.get('_road_match');
+  var roadDict = ee.Dictionary(ee.Algorithms.If(
+    ee.Algorithms.IsEqual(match, null),
+    ee.Dictionary({
+      'road-GRIP4_length_1km_m': null,
+      'road-GRIP4_density_1km_km_per_km2': null
+    }),
+    ee.Feature(match).toDictionary([
+      'road-GRIP4_length_1km_m',
+      'road-GRIP4_density_1km_km_per_km2'
+    ])
+  ));
+  var result = feature.set(roadDict);
+  return result.select(result.propertyNames()
+    .remove('_access_location_key')
+    .remove('_road_match'));
+});
+
+// Row preservation: dated rows + undated rows = original source rows.
+features = features.merge(undatedWithRoads);
+
 var features = qcn_kg_m2.reduceRegions({
   collection: features,
   reducer: ee.Reducer.first(),
@@ -1586,7 +1702,7 @@ var features = qcn_kg_m2.reduceRegions({
   
 
 
-var description = '2026-11-11-tabFato-stats';
+var description = '2026-11-17-tabFato-stats-safeNA';
 var folder = 'fire-fapesp';
 Export.table.toDrive({
   collection:features,

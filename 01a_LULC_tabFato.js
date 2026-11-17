@@ -12,7 +12,8 @@ var asset = 'users/dh-conciani/help/fire-fapesp/2026-11-11-fire-fapesp-fato';
 // Keep a lightweight immutable source collection.
 // Every expensive metric branch is derived from this source independently.
 // Results are joined only after the branch-specific calculations.
-// PATCH 2026-11-17 (v2): Validate date fields BEFORE Number.parse().
+// PATCH 2026-11-17 (v3): Reduce peak memory during final QCN extraction.
+// Previous patch: Validate date fields BEFORE Number.parse().
 // Source year/month/day may be numeric, numeric text, null, or 'NA'.
 // Records with unresolvable dates are NOT dropped from the final CSV.
 // Their date-dependent metrics remain empty; static roads and QCN carbon
@@ -326,7 +327,7 @@ var coverageMetricsUnique = uniqueLocationYearsFast.map(function(feature) {
       geometry: buffer,
       scale: scale,
       maxPixels: 1e13,
-      tileScale: 4
+      tileScale: 8
     });
 
   var groups = ee.List(
@@ -673,7 +674,7 @@ var urbanMetricsByYear = ee.FeatureCollection(
         geometry: feature.geometry(),
         scale: URBAN_DISTANCE_SCALE_M,
         maxPixels: 1e8,
-        tileScale: 4
+        tileScale: 8
       }).get('urban-distance_m');
 
       var beyond30km = ee.Algorithms.IsEqual(
@@ -930,7 +931,8 @@ function reduceRegion_first_climate(image, geom) {
     reducer: ee.Reducer.first(),
     geometry: geom,
     scale: climateScale,
-    maxPixels: 1e13
+    maxPixels: 1e13,
+    tileScale: 8
   });
 }
 
@@ -1309,7 +1311,7 @@ function hwSample(image, geometry) {
     geometry: geometry,
     scale: HEATWAVE_SCALE_M,
     maxPixels: 1e8,
-    tileScale: 4
+    tileScale: 8
   });
 }
 
@@ -1570,7 +1572,8 @@ var fuelComputedList = years.map(function(year) {
           reducer: ee.Reducer.first(),
           geometry: feature.geometry(),
           scale: scale,
-          maxPixels: 1e13
+          maxPixels: 1e13,
+          tileScale: 8
         });
 
       return ee.Feature(null, {
@@ -1692,17 +1695,26 @@ var undatedWithRoads = ee.FeatureCollection(
 // Row preservation: dated rows + undated rows = original source rows.
 features = features.merge(undatedWithRoads);
 
-var features = qcn_kg_m2.reduceRegions({
-  collection: features,
-  reducer: ee.Reducer.first(),
-  scale: 30,
-  tileScale: 4,
-  maxPixelsPerRegion: 1e13
+// MEMORY PATCH 2026-11-17 (v3): avoid a single collection-wide
+// reduceRegions() over the fully-enriched, deeply-joined fire table.
+// Google Earth Engine's recommended fallback for large reductions is
+// per-feature reduceRegion(), which lets each point be handled separately.
+// Raster and output band names, scale, and first-pixel reducer are unchanged.
+features = features.map(function(feature) {
+  feature = ee.Feature(feature);
+  var qcnAtPoint = qcn_kg_m2.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: feature.geometry(),
+    scale: 30,
+    maxPixels: 1e8,
+    tileScale: 8
+  });
+  return feature.set(qcnAtPoint);
 });
   
 
 
-var description = '2026-11-17-tabFato-stats-safeNA';
+var description = '2026-11-17-tabFato-stats-memoryV3';
 var folder = 'fire-fapesp';
 Export.table.toDrive({
   collection:features,

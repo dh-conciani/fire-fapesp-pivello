@@ -1,876 +1,1712 @@
-// FIRE-FAPESP: FULL-PRODUCTION SINGLE CSV EXPORT
-// ALL years 1985-2025, ALL source fire records, ALL original metric branches.
-// NO testing limits, NO row partitions, NO separate branch exports.
-// Optimized heatwaves use temporal max reductions instead of per-point toBands
-// and 3,650-step lists. Console prints/charts disabled for export.
-// IMPORTANT: One-task exports can still time out. Earth Engine run NOT verified.
-// Source: 2026-10-15 fire FAPESP code from user.
-//============================================================================
+// ============================================================================
+// FIRE-FAPESP — FULL ORIGINAL METRICS, 20 SOURCE RECORDS PER CSV EXPORT
+// 18 Nov 2026 | ALL original records, ALL years 1985–2025, ALL metric branches.
+//
+// PASTE THE ENTIRE FILE INTO THE GOOGLE EARTH ENGINE CODE EDITOR; CLICK RUN.
+//
+// 1. Read ONLY the original feature IDs (cheap source metadata; no rasters).
+// 2. Sort and check the IDs on the client, then split into groups of 20.
+// 3. Queue ONE INDEPENDENT Export.table.toDrive task for each ID group.
+// 4. Every task computes ALL the original metric branches for its records.
+// 5. Output: B0001_ofNNNN ... BNNNN_ofNNNN CSVs in Drive/fire-fapesp.
+//
+// No geographic partitioning. No year partitioning. No asset prerequisites.
+// Date safeguards retained: missing Day='NA' -> day 1, invalid year/month
+// rows are included with empty date-dependent metrics and static road/carbon.
+// Every original source feature ID is selected for exactly one batch.
+//
+// IMPORTANT: The Google Earth Engine Code Editor creates tasks but does NOT
+// automatically submit/start them. Use the Tasks panel to start them.
+// Earth Engine limits project task queues to <=3000 pending tasks; the editor
+// may become slow long before that. 20 points/task still can exhaust memory
+// for especially costly records. This script is syntax checked but has NOT
+// been executed on the private dataset.
+//
+// To retry a failed batch, set ONLY_BATCH_NUMBERS = [3, 7] and Run again.
+// Do not mix original 12-way CSVs with this new 20-record output.
+// ============================================================================
 
-var asset = 'users/dh-conciani/help/fire-fapesp/2026-11-11-fire-fapesp-fato';
+var FIRE_FAPESP_SOURCE_ASSET =
+  'users/dh-conciani/help/fire-fapesp/2026-11-11-fire-fapesp-fato';
+var BATCH_SIZE = 20;
+var OUTPUT_PREFIX = 'FIRE_FAPESP_1985_2025_ALL_METRICS_20PTS';
+var ONLY_BATCH_NUMBERS = []; // [] queues ALL; example [3, 7] retries only these
+var MAX_BATCHES_TO_QUEUE = 3000; // Earth Engine per-project pending-task limit
 
-// Keep a lightweight immutable source collection.
-// Every expensive metric branch is derived from this source independently.
-// Results are joined only after the branch-specific calculations.
-// PATCH 2026-11-17 (v3): Reduce peak memory during final QCN extraction.
-// Previous patch: Validate date fields BEFORE Number.parse().
-// Source year/month/day may be numeric, numeric text, null, or 'NA'.
-// Records with unresolvable dates are NOT dropped from the final CSV.
-// Their date-dependent metrics remain empty; static roads and QCN carbon
-// are still computed. No arbitrary replacement year/month is used for metrics.
-
-var sourceFeaturesRaw = ee.FeatureCollection(asset);
-
-function sourceFieldText(feature, field) {
-  var value = ee.Feature(feature).get(field);
-  return ee.String(ee.Algorithms.If(
-    ee.Algorithms.IsEqual(value, null), '', value
-  )).trim();
-}
-
-// Accept 1985, '1985', '1985.0', etc., but not 'NA' or empty strings.
-// IMPORTANT: replace invalid text with a NUMERIC STRING before parsing;
-// do not call Number.parse('NA') in either branch of a conditional.
-function isIntegerText(text) {
-  return ee.String(text).match('^[0-9]+(\\.0+)?$').size().gt(0);
-}
-
-function safeIntegerFromText(text, fallbackText) {
-  var safeText = ee.String(ee.Algorithms.If(
-    isIntegerText(text), text, fallbackText
-  ));
-  return ee.Number.parse(safeText).int();
-}
-
-// Preserve original convention: Day='NA'/missing -> day 1.
-// All other malformed days are marked invalid in classifySourceDate().
-function getSourceDay(feature) {
-  return safeIntegerFromText(sourceFieldText(feature, 'Day'), '1');
-}
-
-function getSourceInteger(feature, field) {
-  // Used only on validated, normalized sourceFeatures.
-  return ee.Number(ee.Feature(feature).get(field)).int();
-}
-
-function classifySourceDate(feature) {
-  feature = ee.Feature(feature);
-  var yearText = sourceFieldText(feature, 'Yr_f_f_');
-  var monthText = sourceFieldText(feature, 'Month');
-  var dayText = sourceFieldText(feature, 'Day');
-
-  // Fallbacks are used ONLY to make validation safe. Any record failing
-  // validation goes to undatedSourceFeatures, not into raster time series.
-  var year = safeIntegerFromText(yearText, '2000');
-  var month = safeIntegerFromText(monthText, '1');
-  var day = safeIntegerFromText(dayText, '1');
-  var allowedMissingDay = dayText.compareTo('').eq(0).or(
-    dayText.match('^NA$', 'i').size().gt(0)
-  );
-  var yearOK = isIntegerText(yearText)
-    .and(year.gte(1985)).and(year.lte(2025));
-  var monthOK = isIntegerText(monthText)
-    .and(month.gte(1)).and(month.lte(12));
-  var dayOK = allowedMissingDay.or(
-    isIntegerText(dayText).and(day.gte(1)).and(day.lte(31))
-  );
-  var valid = yearOK.and(monthOK).and(dayOK);
-
-  return feature.set({
-    '_fire_fapesp_date_valid': ee.Algorithms.If(valid, 1, 0),
-    '_fire_fapesp_year_num': year,
-    '_fire_fapesp_month_num': month
-  });
-}
-
-var dateAuditedSourceFeatures = sourceFeaturesRaw.map(classifySourceDate);
-
-// Valid rows have canonical numeric year/month for year-based filtering,
-// while original Day (including 'NA') is preserved in the output.
-var sourceFeatures = dateAuditedSourceFeatures
-  .filter(ee.Filter.eq('_fire_fapesp_date_valid', 1))
-  .map(function(feature) {
-    feature = ee.Feature(feature);
-    var result = feature.set({
-      'Yr_f_f_': feature.get('_fire_fapesp_year_num'),
-      'Month': feature.get('_fire_fapesp_month_num')
+function queueFullOriginalMetricsForBatch(batchIndex, selectedSourceIds, totalBatches) {
+  // This server-side ID filter is applied to the RAW SOURCE TABLE before
+  // any expensive fire, ERA5, heatwave, Landsat, road or carbon calculations.
+  // Each selectedSourceIds list has at most 20 IDs, built once on the client.
+  // Do not use ee.FeatureCollection.toList() on the large joined result.
+  var sourceFeaturesRaw = ee.FeatureCollection(FIRE_FAPESP_SOURCE_ASSET)
+    .filter(ee.Filter.inList('system:index', selectedSourceIds))
+    .map(function(feature) {
+      feature = ee.Feature(feature);
+      return feature
+        .set('_ff_batch', batchIndex + 1)
+        .set('_ff_source_id', feature.id());
     });
-    return result.select(result.propertyNames()
-      .remove('_fire_fapesp_date_valid')
-      .remove('_fire_fapesp_year_num')
-      .remove('_fire_fapesp_month_num'));
-  });
 
-// Keep every invalid-date source record, retaining its ORIGINAL values.
-var undatedSourceFeatures = dateAuditedSourceFeatures
-  .filter(ee.Filter.eq('_fire_fapesp_date_valid', 0))
-  .map(function(feature) {
+  function sourceFieldText(feature, field) {
+    var value = ee.Feature(feature).get(field);
+    return ee.String(ee.Algorithms.If(
+      ee.Algorithms.IsEqual(value, null), '', value
+    )).trim();
+  }
+
+  // Accept 1985, '1985', '1985.0', etc., but not 'NA' or empty strings.
+  // IMPORTANT: replace invalid text with a NUMERIC STRING before parsing;
+  // do not call Number.parse('NA') in either branch of a conditional.
+  function isIntegerText(text) {
+    return ee.String(text).match('^[0-9]+(\\.0+)?$').size().gt(0);
+  }
+
+  function safeIntegerFromText(text, fallbackText) {
+    var safeText = ee.String(ee.Algorithms.If(
+      isIntegerText(text), text, fallbackText
+    ));
+    return ee.Number.parse(safeText).int();
+  }
+
+  // Preserve original convention: Day='NA'/missing -> day 1.
+  // All other malformed days are marked invalid in classifySourceDate().
+  function getSourceDay(feature) {
+    return safeIntegerFromText(sourceFieldText(feature, 'Day'), '1');
+  }
+
+  function getSourceInteger(feature, field) {
+    // Used only on validated, normalized sourceFeatures.
+    return ee.Number(ee.Feature(feature).get(field)).int();
+  }
+
+  function classifySourceDate(feature) {
     feature = ee.Feature(feature);
-    return feature.select(feature.propertyNames()
-      .remove('_fire_fapesp_date_valid')
-      .remove('_fire_fapesp_year_num')
-      .remove('_fire_fapesp_month_num'));
-  });
+    var yearText = sourceFieldText(feature, 'Yr_f_f_');
+    var monthText = sourceFieldText(feature, 'Month');
+    var dayText = sourceFieldText(feature, 'Day');
 
-// Everything below this point uses only valid dates until the final merge.
-var features = sourceFeatures;
+    // Fallbacks are used ONLY to make validation safe. Any record failing
+    // validation goes to undatedSourceFeatures, not into raster time series.
+    var year = safeIntegerFromText(yearText, '2000');
+    var month = safeIntegerFromText(monthText, '1');
+    var day = safeIntegerFromText(dayText, '1');
+    var allowedMissingDay = dayText.compareTo('').eq(0).or(
+      dayText.match('^NA$', 'i').size().gt(0)
+    );
+    var yearOK = isIntegerText(yearText)
+      .and(year.gte(1985)).and(year.lte(2025));
+    var monthOK = isIntegerText(monthText)
+      .and(month.gte(1)).and(month.lte(12));
+    var dayOK = allowedMissingDay.or(
+      isIntegerText(dayText).and(day.gte(1)).and(day.lte(31))
+    );
+    var valid = yearOK.and(monthOK).and(dayOK);
 
-var columns = [
-  'Day',
-  'Fir_Typ',
-  'Fr_E_ID',
-  'Month',
-  'Site',
-  'Yr_f_f_'
-];
+    return feature.set({
+      '_fire_fapesp_date_valid': ee.Algorithms.If(valid, 1, 0),
+      '_fire_fapesp_year_num': year,
+      '_fire_fapesp_month_num': month
+    });
+  }
 
-// Console table disabled for production.
-// Console diagnostic disabled in full-production export.
+  var dateAuditedSourceFeatures = sourceFeaturesRaw.map(classifySourceDate);
 
+  // Valid rows have canonical numeric year/month for year-based filtering,
+  // while original Day (including 'NA') is preserved in the output.
+  var sourceFeatures = dateAuditedSourceFeatures
+    .filter(ee.Filter.eq('_fire_fapesp_date_valid', 1))
+    .map(function(feature) {
+      feature = ee.Feature(feature);
+      var result = feature.set({
+        'Yr_f_f_': feature.get('_fire_fapesp_year_num'),
+        'Month': feature.get('_fire_fapesp_month_num')
+      });
+      return result.select(result.propertyNames()
+        .remove('_fire_fapesp_date_valid')
+        .remove('_fire_fapesp_year_num')
+        .remove('_fire_fapesp_month_num'));
+    });
 
-// --- --- --- AUXILIAR
-var scale = 30;
-var years = [
-  1985,1986,1987,1988,1989,1990,1991,1992,1993,1994,
-  1995,1996,1997,1998,1999,2000,2001,2002,2003,2004,
-  2005,2006,2007,2008,2009,2010,2011,2012,2013,2014,
-  2015,2016,2017,2018,2019,2020,2021,2022,2023,2024,
-  2025
-];
-// --- --- --- --- --- MÉTRICAS
-// --- --- --- MÉTRICAS HISTÓRICAS SOBRE O FOGO PRÉTERITO
-// ============================================================================
-// FAST VERSION
-// Fire history and MapBiomas neighborhood coverage depend only on:
-//   point location + reference year.
-//
-// The source table contains many repeated location/year combinations.
-// Compute these metrics once per unique location-year and join them back.
-// ============================================================================
+  // Keep every invalid-date source record, retaining its ORIGINAL values.
+  var undatedSourceFeatures = dateAuditedSourceFeatures
+    .filter(ee.Filter.eq('_fire_fapesp_date_valid', 0))
+    .map(function(feature) {
+      feature = ee.Feature(feature);
+      return feature.select(feature.propertyNames()
+        .remove('_fire_fapesp_date_valid')
+        .remove('_fire_fapesp_year_num')
+        .remove('_fire_fapesp_month_num'));
+    });
 
-var fire = ee.Image(
-  'projects/mapbiomas-public/assets/brazil/fire/collection5/' +
-  'mapbiomas_fire_collection5_annual_burned_v1'
-);
+  // Everything below this point uses only valid dates until the final merge.
+  var features = sourceFeatures;
 
-var mapbiomasCoverageRaw = ee.Image(
-  'projects/mapbiomas-public/assets/brazil/lulc/collection11/' +
-  'mapbiomas_brazil_collection11_coverage_v3'
-);
+  var columns = [
+    'Day',
+    'Fir_Typ',
+    'Fr_E_ID',
+    'Month',
+    'Site',
+    'Yr_f_f_'
+  ];
 
-// Stable location + year key.
-function addLocationYearKey(feature) {
-  var coords = ee.List(feature.geometry().coordinates());
-  var lon = ee.Number(coords.get(0));
-  var lat = ee.Number(coords.get(1));
-  var year = getSourceInteger(feature, 'Yr_f_f_');
-
-  var locationKey = lon.format('%.6f')
-    .cat('_')
-    .cat(lat.format('%.6f'));
-
-  var locationYearKey = locationKey
-    .cat('_')
-    .cat(year.format());
-
-  return feature.set({
-    '_location_key_fast': locationKey,
-    '_location_year_key_fast': locationYearKey
-  });
-}
-
-var featuresWithLocationYearKey = features.map(addLocationYearKey);
-
-var uniqueLocationYearsFast = featuresWithLocationYearKey
-  .distinct(['_location_year_key_fast']);
-
-// Console diagnostic disabled in full-production export.
+  // Console table disabled for production.
+  // Console diagnostic disabled in full-production export.
 
 
+  // --- --- --- AUXILIAR
+  var scale = 30;
+  var years = [
+    1985,1986,1987,1988,1989,1990,1991,1992,1993,1994,
+    1995,1996,1997,1998,1999,2000,2001,2002,2003,2004,
+    2005,2006,2007,2008,2009,2010,2011,2012,2013,2014,
+    2015,2016,2017,2018,2019,2020,2021,2022,2023,2024,
+    2025
+  ];
+  // --- --- --- --- --- MÉTRICAS
+  // --- --- --- MÉTRICAS HISTÓRICAS SOBRE O FOGO PRÉTERITO
+  // ============================================================================
+  // FAST VERSION
+  // Fire history and MapBiomas neighborhood coverage depend only on:
+  //   point location + reference year.
+  //
+  // The source table contains many repeated location/year combinations.
+  // Compute these metrics once per unique location-year and join them back.
+  // ============================================================================
 
-// ---------------------------------------------------------------------------
-// FIRE HISTORY — once per unique location-year
-// ---------------------------------------------------------------------------
+  var fire = ee.Image(
+    'projects/mapbiomas-public/assets/brazil/fire/collection5/' +
+    'mapbiomas_fire_collection5_annual_burned_v1'
+  );
 
-var fireMetricsUnique = uniqueLocationYearsFast.map(function(feature) {
+  var mapbiomasCoverageRaw = ee.Image(
+    'projects/mapbiomas-public/assets/brazil/lulc/collection11/' +
+    'mapbiomas_brazil_collection11_coverage_v3'
+  );
 
-  var frequencyHistogram = fire.unmask().reduceRegion({
-    reducer: ee.Reducer.first(),
-    geometry: feature.geometry(),
-    scale: scale,
-    maxPixels: 1e13
-  });
+  // Stable location + year key.
+  function addLocationYearKey(feature) {
+    var coords = ee.List(feature.geometry().coordinates());
+    var lon = ee.Number(coords.get(0));
+    var lat = ee.Number(coords.get(1));
+    var year = getSourceInteger(feature, 'Yr_f_f_');
 
-  var stopIndex = ee.List(years)
-    .indexOf(getSourceInteger(feature, 'Yr_f_f_').add(1));
+    var locationKey = lon.format('%.6f')
+      .cat('_')
+      .cat(lat.format('%.6f'));
 
-  var values = frequencyHistogram.values()
-    .slice(0, stopIndex);
+    var locationYearKey = locationKey
+      .cat('_')
+      .cat(year.format());
 
-  var valuesReversed = values.slice(0).reverse();
+    return feature.set({
+      '_location_key_fast': locationKey,
+      '_location_year_key_fast': locationYearKey
+    });
+  }
 
-  var keys = frequencyHistogram.keys()
-    .slice(0, stopIndex);
+  var featuresWithLocationYearKey = features.map(addLocationYearKey);
 
-  var keysReversed = keys.slice(0).reverse();
+  var uniqueLocationYearsFast = featuresWithLocationYearKey
+    .distinct(['_location_year_key_fast']);
 
-  var recurrence = ee.Number(values.reduce('sum'));
-
-  return ee.Feature(null, {
-    '_location_year_key_fast':
-      feature.get('_location_year_key_fast'),
-
-    'fogo-recorrencia':
-      recurrence,
-
-    'fogo-frequencia':
-      recurrence.divide(values.length()),
-
-    'fogo-primeiro ano':
-      keys.getString(values.indexOf(1)).slice(-4),
-
-    'fogo-ultimo ano':
-      keysReversed
-        .getString(valuesReversed.indexOf(1))
-        .slice(-4)
-  });
-});
+  // Console diagnostic disabled in full-production export.
 
 
-// ---------------------------------------------------------------------------
-// MAPBIOMAS LEVEL-2 COVERAGE IN 1-KM BUFFER
-// ---------------------------------------------------------------------------
-// IMPORTANT OPTIMIZATION:
-//
-// Previous implementation:
-//   1 area-total reduceRegion
-//   + 1 reduceRegion FOR EACH land-cover class
-//   for every source feature.
-//
-// New implementation:
-//   ONE grouped reduction per unique location-year.
-//   ee.Reducer.sum().group() returns all class areas together.
-//
-// We also use remap() on the ONE annual band rather than applying dozens of
-// where() operations to the full 1985-2025 multiband MapBiomas image.
 
-var coverageLegendLevel2 = {
-  3:  'Formação Florestal',
-  4:  'Formação Savânica',
-  5:  'Mangue',
-  6:  'Floresta Alagável',
-  49: 'Restinga Arbórea',
-  11: 'Campo Alagado e Área Pantanosa',
-  12: 'Formação Campestre',
-  32: 'Apicum',
-  29: 'Afloramento Rochoso',
-  50: 'Restinga Herbácea',
-  15: 'Pastagem',
-  18: 'Agricultura',
-  9:  'Silvicultura',
-  21: 'Mosaico de Usos',
-  23: 'Praia, Duna e Areal',
-  24: 'Área Urbanizada',
-  30: 'Mineração',
-  75: 'Usina Fotovoltaica (beta)',
-  25: 'Outras Áreas não Vegetadas',
-  33: 'Rio, Lago e Oceano',
-  31: 'Aquicultura',
-  27: 'Não observado'
-};
+  // ---------------------------------------------------------------------------
+  // FIRE HISTORY — once per unique location-year
+  // ---------------------------------------------------------------------------
 
-var coverageOldValues = [
-  3, 4, 5, 6, 49,
-  11, 12, 32, 29, 50,
-  15, 39, 20, 40, 62, 41, 46, 47, 35, 48,
-  9, 21, 23, 24, 30, 75, 25, 33, 31, 27, 0
-];
+  var fireMetricsUnique = uniqueLocationYearsFast.map(function(feature) {
 
-var coverageLevel2Values = [
-  3, 4, 5, 6, 49,
-  11, 12, 32, 29, 50,
-  15, 18, 18, 18, 18, 18, 18, 18, 18, 18,
-  9, 21, 23, 24, 30, 75, 25, 33, 31, 27, 27
-];
-
-var coverageMetricsUnique = uniqueLocationYearsFast.map(function(feature) {
-
-  var year = getSourceInteger(feature, 'Yr_f_f_');
-  var buffer = feature.geometry().buffer(1000);
-
-  var coverageYear = mapbiomasCoverageRaw
-    .select(
-      ee.String('classification_')
-        .cat(year.format())
-    )
-    .remap(
-      coverageOldValues,
-      coverageLevel2Values,
-      27
-    )
-    .rename('class');
-
-  var areaHa = ee.Image.pixelArea()
-    .divide(10000)
-    .rename('area_ha');
-
-  // Two-band image:
-  // band 0 = area_ha (value to sum)
-  // band 1 = class   (grouping field)
-  var groupedResult = areaHa
-    .addBands(coverageYear)
-    .reduceRegion({
-      reducer: ee.Reducer.sum().group({
-        groupField: 1,
-        groupName: 'class'
-      }),
-      geometry: buffer,
+    var frequencyHistogram = fire.unmask().reduceRegion({
+      reducer: ee.Reducer.first(),
+      geometry: feature.geometry(),
       scale: scale,
+      maxPixels: 1e13
+    });
+
+    var stopIndex = ee.Number(ee.List(years)
+      .indexOf(getSourceInteger(feature, 'Yr_f_f_').add(1)));
+    // For year 2025, year+1=2026 is absent from years[]. Earth Engine returns
+    // -1, which incorrectly cuts off the last annual fire band. Use all bands.
+    stopIndex = ee.Number(ee.Algorithms.If(
+      stopIndex.lt(0), years.length, stopIndex
+    ));
+
+    var values = frequencyHistogram.values()
+      .slice(0, stopIndex);
+
+    var valuesReversed = values.slice(0).reverse();
+
+    var keys = frequencyHistogram.keys()
+      .slice(0, stopIndex);
+
+    var keysReversed = keys.slice(0).reverse();
+
+    var recurrence = ee.Number(values.reduce('sum'));
+
+    return ee.Feature(null, {
+      '_location_year_key_fast':
+        feature.get('_location_year_key_fast'),
+
+      'fogo-recorrencia':
+        recurrence,
+
+      'fogo-frequencia':
+        recurrence.divide(values.length()),
+
+      'fogo-primeiro ano':
+        keys.getString(values.indexOf(1)).slice(-4),
+
+      'fogo-ultimo ano':
+        keysReversed
+          .getString(valuesReversed.indexOf(1))
+          .slice(-4)
+    });
+  });
+
+
+  // ---------------------------------------------------------------------------
+  // MAPBIOMAS LEVEL-2 COVERAGE IN 1-KM BUFFER
+  // ---------------------------------------------------------------------------
+  // IMPORTANT OPTIMIZATION:
+  //
+  // Previous implementation:
+  //   1 area-total reduceRegion
+  //   + 1 reduceRegion FOR EACH land-cover class
+  //   for every source feature.
+  //
+  // New implementation:
+  //   ONE grouped reduction per unique location-year.
+  //   ee.Reducer.sum().group() returns all class areas together.
+  //
+  // We also use remap() on the ONE annual band rather than applying dozens of
+  // where() operations to the full 1985-2025 multiband MapBiomas image.
+
+  var coverageLegendLevel2 = {
+    3:  'Formação Florestal',
+    4:  'Formação Savânica',
+    5:  'Mangue',
+    6:  'Floresta Alagável',
+    49: 'Restinga Arbórea',
+    11: 'Campo Alagado e Área Pantanosa',
+    12: 'Formação Campestre',
+    32: 'Apicum',
+    29: 'Afloramento Rochoso',
+    50: 'Restinga Herbácea',
+    15: 'Pastagem',
+    18: 'Agricultura',
+    9:  'Silvicultura',
+    21: 'Mosaico de Usos',
+    23: 'Praia, Duna e Areal',
+    24: 'Área Urbanizada',
+    30: 'Mineração',
+    75: 'Usina Fotovoltaica (beta)',
+    25: 'Outras Áreas não Vegetadas',
+    33: 'Rio, Lago e Oceano',
+    31: 'Aquicultura',
+    27: 'Não observado'
+  };
+
+  var coverageOldValues = [
+    3, 4, 5, 6, 49,
+    11, 12, 32, 29, 50,
+    15, 39, 20, 40, 62, 41, 46, 47, 35, 48,
+    9, 21, 23, 24, 30, 75, 25, 33, 31, 27, 0
+  ];
+
+  var coverageLevel2Values = [
+    3, 4, 5, 6, 49,
+    11, 12, 32, 29, 50,
+    15, 18, 18, 18, 18, 18, 18, 18, 18, 18,
+    9, 21, 23, 24, 30, 75, 25, 33, 31, 27, 27
+  ];
+
+  var coverageMetricsUnique = uniqueLocationYearsFast.map(function(feature) {
+
+    var year = getSourceInteger(feature, 'Yr_f_f_');
+    var buffer = feature.geometry().buffer(1000);
+
+    var coverageYear = mapbiomasCoverageRaw
+      .select(
+        ee.String('classification_')
+          .cat(year.format())
+      )
+      .remap(
+        coverageOldValues,
+        coverageLevel2Values,
+        27
+      )
+      .rename('class');
+
+    var areaHa = ee.Image.pixelArea()
+      .divide(10000)
+      .rename('area_ha');
+
+    // Two-band image:
+    // band 0 = area_ha (value to sum)
+    // band 1 = class   (grouping field)
+    var groupedResult = areaHa
+      .addBands(coverageYear)
+      .reduceRegion({
+        reducer: ee.Reducer.sum().group({
+          groupField: 1,
+          groupName: 'class'
+        }),
+        geometry: buffer,
+        scale: scale,
+        maxPixels: 1e13,
+        tileScale: 8
+      });
+
+    var groups = ee.List(
+      ee.Dictionary(groupedResult).get(
+        'groups',
+        ee.List([])
+      )
+    );
+
+    // Convert [{class:3,sum:x}, ...] to {'3':x, ...}.
+    var classKeys = groups.map(function(item) {
+      item = ee.Dictionary(item);
+      return ee.Number(item.get('class')).format();
+    });
+
+    var classAreas = groups.map(function(item) {
+      item = ee.Dictionary(item);
+      return ee.Number(item.get('sum'));
+    });
+
+    var areaByClass = ee.Dictionary.fromLists(
+      classKeys,
+      classAreas
+    );
+
+    var areaTotal = ee.Number(
+      classAreas.reduce(
+        ee.Reducer.sum()
+      )
+    );
+
+    var out = ee.Feature(null, {
+      '_location_year_key_fast':
+        feature.get('_location_year_key_fast'),
+      'cob_ha-AreaTotal':
+        areaTotal
+    });
+
+    Object.keys(coverageLegendLevel2).forEach(function(key) {
+
+      var classArea = ee.Number(
+        areaByClass.get(
+          String(key),
+          0
+        )
+      );
+
+      var className = coverageLegendLevel2[key];
+
+      out = out
+        .set(
+          'cob_ha-' + className,
+          classArea
+        )
+        .set(
+          'cob_percent-' + className,
+          ee.Algorithms.If(
+            areaTotal.gt(0),
+            classArea
+              .multiply(100)
+              .divide(areaTotal),
+            null
+          )
+        );
+    });
+
+    return out;
+  });
+
+
+  // ---------------------------------------------------------------------------
+  // JOIN FIRE + COVERAGE BACK TO ALL ORIGINAL ROWS
+  // ---------------------------------------------------------------------------
+
+  var fireMetricNamesFast = [
+    'fogo-recorrencia',
+    'fogo-frequencia',
+    'fogo-primeiro ano',
+    'fogo-ultimo ano'
+  ];
+
+  var coverageMetricNamesFast = [
+    'cob_ha-AreaTotal'
+  ];
+
+  Object.keys(coverageLegendLevel2).forEach(function(key) {
+    var className = coverageLegendLevel2[key];
+    coverageMetricNamesFast.push(
+      'cob_ha-' + className
+    );
+    coverageMetricNamesFast.push(
+      'cob_percent-' + className
+    );
+  });
+
+  var fireJoinFast = ee.Join.saveFirst(
+    '_fire_match_fast'
+  );
+
+  var withFireFast = ee.FeatureCollection(
+    fireJoinFast.apply(
+      featuresWithLocationYearKey,
+      fireMetricsUnique,
+      ee.Filter.equals({
+        leftField: '_location_year_key_fast',
+        rightField: '_location_year_key_fast'
+      })
+    )
+  ).map(function(feature) {
+
+    feature = ee.Feature(feature);
+    var match = ee.Feature(
+      feature.get('_fire_match_fast')
+    );
+
+    return feature.set(
+      match.toDictionary(
+        fireMetricNamesFast
+      )
+    );
+  });
+
+  var coverageJoinFast = ee.Join.saveFirst(
+    '_coverage_match_fast'
+  );
+
+  features = ee.FeatureCollection(
+    coverageJoinFast.apply(
+      withFireFast,
+      coverageMetricsUnique,
+      ee.Filter.equals({
+        leftField: '_location_year_key_fast',
+        rightField: '_location_year_key_fast'
+      })
+    )
+  ).map(function(feature) {
+
+    feature = ee.Feature(feature);
+    var match = ee.Feature(
+      feature.get('_coverage_match_fast')
+    );
+
+    var result = feature.set(
+      match.toDictionary(
+        coverageMetricNamesFast
+      )
+    );
+
+    return result.select(
+      result.propertyNames()
+        .remove('_fire_match_fast')
+        .remove('_coverage_match_fast')
+        .remove('_location_key_fast')
+        .remove('_location_year_key_fast')
+    );
+  });
+
+  // Console diagnostic disabled in full-production export.
+
+
+
+
+  // --- --- --- MÉTRICAS DE ACESSIBILIDADE / ANTROPIZAÇÃO
+  // ============================================================================
+  // DISTÂNCIA À ÁREA URBANIZADA + DENSIDADE DE ESTRADAS
+  //
+  // URBANO:
+  // - MapBiomas Collection 11
+  // - classe 24 = Área Urbanizada
+  // - usa a classificação do MESMO ANO de Yr_f_f_
+  // - distância Euclidiana calculada com ee.Image.distance()
+  // - MapBiomas original = 30 m; grade operacional da distância = 120 m
+  // - kernel Euclidiano limitado a 30 km
+  // - se não houver classe 24 até 30 km:
+  //       urban-distance_m = null
+  //       urban-distance_gt30km = 1
+  //       urban-distance_label = '>30 km'
+  //
+  // ESTRADAS:
+  // - GRIP4 Central-South America
+  // - rede viária estática (não anual)
+  // - comprimento total de estradas dentro de buffer circular de 1 km
+  // - densidade = km de estrada / km² de buffer
+  //
+  // As métricas são calculadas apenas para combinações únicas:
+  // - urbano: localização + ano
+  // - estrada: localização
+  // e depois associadas novamente a todos os registros.
+  // ============================================================================
+
+  var accessibilityMapBiomas = ee.Image(
+    'projects/mapbiomas-public/assets/brazil/lulc/collection11/' +
+    'mapbiomas_brazil_collection11_coverage_v3'
+  );
+
+  var accessibilityRoadsGRIP4 = ee.FeatureCollection(
+    'projects/sat-io/open-datasets/GRIP4/Central-South-America'
+  );
+
+  var URBAN_CLASS = 24;
+  var URBAN_SOURCE_SCALE_M = 30;
+  var URBAN_DISTANCE_SCALE_M = 120; // operational grid for 30-km Euclidean kernel
+  var URBAN_MAX_DISTANCE_M = 30000;  // 30 km
+
+  var ROAD_BUFFER_M = 1000;
+
+  // Kernel Euclidiano em metros.
+  // ee.Image.distance() mascara pixels cuja distância excede o raio do kernel.
+  // At 30 m, a 30-km radius would create a 2001-pixel-wide kernel,
+  // exceeding Earth Engine's 512-pixel kernel limit.
+  // At 120 m, the same 30-km radius is 250 pixels, i.e. 501 pixels wide.
+  var urbanEuclideanKernel = ee.Kernel.euclidean(
+    URBAN_MAX_DISTANCE_M,
+    'meters'
+  );
+
+
+  // ---------------------------------------------------------------------------
+  // CHAVES PARA EVITAR CÁLCULOS REPETIDOS
+  // ---------------------------------------------------------------------------
+
+  function addAccessibilityKeys(feature) {
+
+    var coords = ee.List(
+      feature.geometry().coordinates()
+    );
+
+    var lon = ee.Number(coords.get(0));
+    var lat = ee.Number(coords.get(1));
+    var year = getSourceInteger(feature, 'Yr_f_f_');
+
+    var locationKey = lon.format('%.6f')
+      .cat('_')
+      .cat(lat.format('%.6f'));
+
+    var accessKey = locationKey
+      .cat('_')
+      .cat(year.format());
+
+    return feature.set({
+      '_access_location_key': locationKey,
+      '_access_year_key': accessKey
+    });
+  }
+
+  // Lightweight collection used ONLY to determine unique accessibility requests.
+  var accessibilityInput = sourceFeatures.map(
+    addAccessibilityKeys
+  );
+
+  var uniqueAccessibilityLocationYears =
+    accessibilityInput
+      .distinct(['_access_year_key']);
+
+  // Road density is date-independent. Include locations whose year/month
+  // are missing or 'NA' so those records also get the static road metric.
+  function addRoadLocationKey(feature) {
+    feature = ee.Feature(feature);
+    var coords = ee.List(feature.geometry().coordinates());
+    var locationKey = ee.Number(coords.get(0)).format('%.6f')
+      .cat('_')
+      .cat(ee.Number(coords.get(1)).format('%.6f'));
+    return feature.set('_access_location_key', locationKey);
+  }
+
+  var uniqueAccessibilityLocations = sourceFeaturesRaw
+    .map(addRoadLocationKey)
+    .distinct(['_access_location_key']);
+
+  // Add the same keys to the already-enriched output only for the final joins.
+  var featuresWithAccessibilityKeys = features.map(
+    addAccessibilityKeys
+  );
+
+  // Console diagnostic disabled in full-production export.
+
+
+
+  // ---------------------------------------------------------------------------
+  // 1) DISTÂNCIA EUCLIDIANA À CLASSE 24, LIMITADA A 30 KM
+  // ---------------------------------------------------------------------------
+  // Para cada ano:
+  //   1. seleciona classification_<ano>
+  //   2. cria máscara binária de classe 24
+  //   3. calcula distância Euclidiana apenas até 30 km
+  //   4. amostra somente os pontos daquele ano
+  //
+  // Não existe cálculo de distância além de 30 km.
+
+  var accessibilityYears = ee.List(
+    uniqueAccessibilityLocationYears
+      .aggregate_array('Yr_f_f_')
+  ).distinct().sort();
+
+  var urbanMetricsByYear = ee.FeatureCollection(
+    accessibilityYears.map(function(y) {
+
+      y = ee.Number(y).int();
+
+      var pointsThisYear =
+        uniqueAccessibilityLocationYears.filter(
+          ee.Filter.eq('Yr_f_f_', y)
+        );
+
+      var urbanMask30m = accessibilityMapBiomas
+        .select(
+          ee.String('classification_')
+            .cat(y.format())
+        )
+        .eq(URBAN_CLASS)
+        .unmask(0)
+        .rename('urban');
+
+      // Aggregate the original 30-m MapBiomas urban mask to 120 m.
+      // MAX preserves urban presence: if any 30-m class-24 pixel occurs
+      // inside the 120-m cell, that cell is treated as urban.
+      //
+      // This is necessary because a 30-km Euclidean kernel at 30 m would
+      // be 2001 pixels wide, above Earth Engine's 512-pixel kernel limit.
+      var urbanMask120m = urbanMask30m
+        .reduceResolution({
+          reducer: ee.Reducer.max(),
+          maxPixels: 64
+        })
+        .reproject({
+          crs: urbanMask30m.projection(),
+          scale: URBAN_DISTANCE_SCALE_M
+        })
+        .rename('urban');
+
+      // Euclidean distance is evaluated only up to 30 km.
+      // Pixels farther than 30 km remain masked.
+      var urbanDistance = urbanMask120m
+        .distance(
+          urbanEuclideanKernel,
+          false
+        )
+        .rename('urban-distance_m');
+
+      return pointsThisYear.map(function(feature) {
+
+        var d = urbanDistance.reduceRegion({
+          reducer: ee.Reducer.first(),
+          geometry: feature.geometry(),
+          scale: URBAN_DISTANCE_SCALE_M,
+          maxPixels: 1e8,
+          tileScale: 8
+        }).get('urban-distance_m');
+
+        var beyond30km = ee.Algorithms.IsEqual(
+          d,
+          null
+        );
+
+        return ee.Feature(null, {
+          '_access_year_key':
+            feature.get('_access_year_key'),
+
+          // Exact numeric distance only when an urban pixel occurs <=30 km.
+          'urban-distance_m':
+            ee.Algorithms.If(
+              beyond30km,
+              null,
+              d
+            ),
+
+          // Useful numeric censoring flag for statistical analysis.
+          'urban-distance_gt30km':
+            ee.Algorithms.If(
+              beyond30km,
+              1,
+              0
+            ),
+
+          // Human-readable output requested.
+          'urban-distance_label':
+            ee.Algorithms.If(
+              beyond30km,
+              '>30 km',
+              '<=30 km'
+            ),
+
+          // Metadata describing the operational distance calculation.
+          'urban-distance_resolution_m':
+            URBAN_DISTANCE_SCALE_M,
+
+          'urban-distance_method':
+            'MapBiomas class 24; Euclidean kernel <=30 km; 120 m operational grid'
+        });
+      });
+    })
+  ).flatten();
+
+  // Console diagnostic disabled in full-production export.
+
+
+
+  // ---------------------------------------------------------------------------
+  // 2) DENSIDADE DE ESTRADAS GRIP4 NO BUFFER DE 1 KM
+  // ---------------------------------------------------------------------------
+  // GRIP4 é estático. Portanto esta métrica NÃO varia com Yr_f_f_.
+  //
+  // Para cada localização única:
+  //   - cria buffer circular de 1 km;
+  //   - seleciona somente estradas que interceptam o buffer;
+  //   - recorta cada linha ao buffer;
+  //   - soma o comprimento em metros;
+  //   - calcula km de estrada / km² de buffer.
+
+  var roadMetricsUnique = uniqueAccessibilityLocations.map(
+    function(feature) {
+
+      var buffer = feature.geometry().buffer(
+        ROAD_BUFFER_M,
+        20
+      );
+
+      var localRoads = accessibilityRoadsGRIP4
+        .filterBounds(buffer);
+
+      var roadLengths = localRoads.map(
+        function(road) {
+
+          var clipped = ee.Feature(road)
+            .geometry()
+            .intersection(
+              buffer,
+              20
+            );
+
+          return ee.Feature(null, {
+            '_road_length_m':
+              clipped.length(20)
+          });
+        }
+      );
+
+      var totalRoadLengthM = ee.Number(
+        ee.Algorithms.If(
+          localRoads.size().gt(0),
+          roadLengths.aggregate_sum(
+            '_road_length_m'
+          ),
+          0
+        )
+      );
+
+      var bufferAreaKm2 = buffer
+        .area(20)
+        .divide(1e6);
+
+      var roadDensityKmPerKm2 =
+        totalRoadLengthM
+          .divide(1000)
+          .divide(bufferAreaKm2);
+
+      return ee.Feature(null, {
+        '_access_location_key':
+          feature.get('_access_location_key'),
+
+        'road-GRIP4_length_1km_m':
+          totalRoadLengthM,
+
+        'road-GRIP4_density_1km_km_per_km2':
+          roadDensityKmPerKm2
+      });
+    }
+  );
+
+  // Console diagnostic disabled in full-production export.
+
+
+
+  // ---------------------------------------------------------------------------
+  // 3) JOIN URBANO + ESTRADAS DE VOLTA A TODOS OS REGISTROS
+  // ---------------------------------------------------------------------------
+
+  // --- urbano: localização + ano
+  var urbanJoin = ee.Join.saveFirst(
+    '_urban_match'
+  );
+
+  var featuresWithUrban = ee.FeatureCollection(
+    urbanJoin.apply(
+      featuresWithAccessibilityKeys,
+      urbanMetricsByYear,
+      ee.Filter.equals({
+        leftField: '_access_year_key',
+        rightField: '_access_year_key'
+      })
+    )
+  ).map(function(feature) {
+
+    feature = ee.Feature(feature);
+
+    var match = feature.get('_urban_match');
+
+    var urbanDict = ee.Dictionary(
+      ee.Algorithms.If(
+        ee.Algorithms.IsEqual(match, null),
+        ee.Dictionary({
+          'urban-distance_m': null,
+          'urban-distance_gt30km': null,
+          'urban-distance_label': null,
+          'urban-distance_resolution_m': null,
+          'urban-distance_method': null
+        }),
+        ee.Feature(match).toDictionary([
+          'urban-distance_m',
+          'urban-distance_gt30km',
+          'urban-distance_label',
+          'urban-distance_resolution_m',
+          'urban-distance_method'
+        ])
+      )
+    );
+
+    return feature.set(urbanDict);
+  });
+
+
+  // --- estradas: localização
+  var roadJoinAccessibility = ee.Join.saveFirst(
+    '_road_match'
+  );
+
+  features = ee.FeatureCollection(
+    roadJoinAccessibility.apply(
+      featuresWithUrban,
+      roadMetricsUnique,
+      ee.Filter.equals({
+        leftField: '_access_location_key',
+        rightField: '_access_location_key'
+      })
+    )
+  ).map(function(feature) {
+
+    feature = ee.Feature(feature);
+
+    var match = feature.get('_road_match');
+
+    var roadDict = ee.Dictionary(
+      ee.Algorithms.If(
+        ee.Algorithms.IsEqual(match, null),
+        ee.Dictionary({
+          'road-GRIP4_length_1km_m': null,
+          'road-GRIP4_density_1km_km_per_km2': null
+        }),
+        ee.Feature(match).toDictionary([
+          'road-GRIP4_length_1km_m',
+          'road-GRIP4_density_1km_km_per_km2'
+        ])
+      )
+    );
+
+    var result = feature.set(roadDict);
+
+    // Remove propriedades internas usadas somente nos joins.
+    return result.select(
+      result.propertyNames()
+        .remove('_access_location_key')
+        .remove('_access_year_key')
+        .remove('_urban_match')
+        .remove('_road_match')
+    );
+  });
+
+  // Console diagnostic disabled in full-production export.
+
+
+
+
+  // --- --- --- MÉTRICAS DE CLIMA
+  // FAST VERSION:
+  // 1) compute climate only once for each UNIQUE point + reference date;
+  // 2) use ERA5-Land MONTHLY_AGGR for calendar-year and 1991-2020 precipitation;
+  // 3) keep the exact 10-year search for the preceding dry spell;
+  // 4) heatwaves are calculated separately from the supplied daily binary dataset.
+
+  var climateScale = 11132;
+  var DRY_DAY_THRESHOLD_MM = 1.0;
+  var DRY_LOOKBACK_YEARS = 10;
+
+  var hourly = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY');
+  var daily = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR');
+  var monthly = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR');
+
+  // ---------------------------------------------------------------------------
+  // HELPERS
+  // ---------------------------------------------------------------------------
+
+  function select_temperature_celsius_by_hourly(image) {
+    return image
+      .select('temperature_2m')
+      .subtract(273.15)
+      .rename('temperature_2m');
+  }
+
+  function reduceRegion_first_climate(image, geom) {
+    return image.reduceRegion({
+      reducer: ee.Reducer.first(),
+      geometry: geom,
+      scale: climateScale,
       maxPixels: 1e13,
       tileScale: 8
     });
+  }
 
-  var groups = ee.List(
-    ee.Dictionary(groupedResult).get(
-      'groups',
-      ee.List([])
-    )
-  );
+  function getClimatePointDate(feature) {
+    var year = getSourceInteger(feature, 'Yr_f_f_');
+    var month = getSourceInteger(feature, 'Month');
+    var day = getSourceDay(feature);
 
-  // Convert [{class:3,sum:x}, ...] to {'3':x, ...}.
-  var classKeys = groups.map(function(item) {
-    item = ee.Dictionary(item);
-    return ee.Number(item.get('class')).format();
+    return ee.Date.fromYMD(year, month, day);
+  }
+
+  // ---------------------------------------------------------------------------
+  // PRECIPITATION IN MILLIMETRES
+  // ---------------------------------------------------------------------------
+
+  var precipitationDailyMM = daily.map(function(image) {
+    return image
+      .select('total_precipitation_sum')
+      .multiply(1000)
+      .max(0)
+      .rename('precip_mm')
+      .copyProperties(image, ['system:time_start']);
   });
 
-  var classAreas = groups.map(function(item) {
-    item = ee.Dictionary(item);
-    return ee.Number(item.get('sum'));
+  // MONTHLY_AGGR already contains the monthly sum of flow variables.
+  // This is much cheaper for long climatological/calendar-year calculations.
+  var precipitationMonthlyMM = monthly.map(function(image) {
+    return image
+      .select('total_precipitation_sum')
+      .multiply(1000)
+      .max(0)
+      .rename('precip_mm')
+      .copyProperties(image, ['system:time_start']);
   });
 
-  var areaByClass = ee.Dictionary.fromLists(
-    classKeys,
-    classAreas
+  // 360 monthly images rather than ~10,958 daily images.
+  var meanAnnualPrecip1991_2020 = precipitationMonthlyMM
+    .filterDate('1991-01-01', '2021-01-01')
+    .sum()
+    .divide(30)
+    .rename('precip_mean_annual_1991_2020_mm');
+
+  // ---------------------------------------------------------------------------
+  // ADD A CLIMATE KEY AND REMOVE DUPLICATE CLIMATE REQUESTS
+  // ---------------------------------------------------------------------------
+  // Climate values depend only on:
+  //   point geometry + reference date.
+  //
+  // Many rows in the source table have the same point/date. Compute those once
+  // and join the resulting climate properties back to every original row.
+
+  function addClimateKey(feature) {
+    var coords = ee.List(feature.geometry().coordinates());
+    var lon = ee.Number(coords.get(0));
+    var lat = ee.Number(coords.get(1));
+    var date = getClimatePointDate(feature);
+
+    var key = lon.format('%.6f')
+      .cat('_')
+      .cat(lat.format('%.6f'))
+      .cat('_')
+      .cat(date.format('YYYYMMdd'));
+
+    return feature.set('_climate_key', key);
+  }
+
+  // Determine unique climate requests from the lightweight source table.
+  var climateInput = sourceFeatures.map(
+    addClimateKey
   );
 
-  var areaTotal = ee.Number(
-    classAreas.reduce(
-      ee.Reducer.sum()
-    )
+  var climateUniqueInput = climateInput
+    .distinct(['_climate_key']);
+
+  // Add the same key to the enriched output only for the final join.
+  var featuresWithClimateKey = features.map(
+    addClimateKey
   );
 
-  var out = ee.Feature(null, {
-    '_location_year_key_fast':
-      feature.get('_location_year_key_fast'),
-    'cob_ha-AreaTotal':
-      areaTotal
-  });
-
-  Object.keys(coverageLegendLevel2).forEach(function(key) {
-
-    var classArea = ee.Number(
-      areaByClass.get(
-        String(key),
-        0
-      )
-    );
-
-    var className = coverageLegendLevel2[key];
-
-    out = out
-      .set(
-        'cob_ha-' + className,
-        classArea
-      )
-      .set(
-        'cob_percent-' + className,
-        ee.Algorithms.If(
-          areaTotal.gt(0),
-          classArea
-            .multiply(100)
-            .divide(areaTotal),
-          null
-        )
-      );
-  });
-
-  return out;
-});
+  // Console diagnostic disabled in full-production export.
 
 
-// ---------------------------------------------------------------------------
-// JOIN FIRE + COVERAGE BACK TO ALL ORIGINAL ROWS
-// ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // CONSECUTIVE DRY DAYS IMMEDIATELY BEFORE REFERENCE DATE
+  // ---------------------------------------------------------------------------
+  // Exact configured lookback is retained: 10 years.
+  // Only unique point/date combinations are evaluated.
 
-var fireMetricNamesFast = [
-  'fogo-recorrencia',
-  'fogo-frequencia',
-  'fogo-primeiro ano',
-  'fogo-ultimo ano'
-];
+  function consecutiveDryDaysBefore(feature, pointDate) {
+    var geom = feature.geometry();
+    var searchStart = pointDate.advance(-DRY_LOOKBACK_YEARS, 'year');
 
-var coverageMetricNamesFast = [
-  'cob_ha-AreaTotal'
-];
+    var lastWetDateImage = precipitationDailyMM
+      .filterDate(searchStart, pointDate)
+      .map(function(image) {
+        var wet = image.select('precip_mm')
+          .gte(DRY_DAY_THRESHOLD_MM);
 
-Object.keys(coverageLegendLevel2).forEach(function(key) {
-  var className = coverageLegendLevel2[key];
-  coverageMetricNamesFast.push(
-    'cob_ha-' + className
-  );
-  coverageMetricNamesFast.push(
-    'cob_percent-' + className
-  );
-});
-
-var fireJoinFast = ee.Join.saveFirst(
-  '_fire_match_fast'
-);
-
-var withFireFast = ee.FeatureCollection(
-  fireJoinFast.apply(
-    featuresWithLocationYearKey,
-    fireMetricsUnique,
-    ee.Filter.equals({
-      leftField: '_location_year_key_fast',
-      rightField: '_location_year_key_fast'
-    })
-  )
-).map(function(feature) {
-
-  feature = ee.Feature(feature);
-  var match = ee.Feature(
-    feature.get('_fire_match_fast')
-  );
-
-  return feature.set(
-    match.toDictionary(
-      fireMetricNamesFast
-    )
-  );
-});
-
-var coverageJoinFast = ee.Join.saveFirst(
-  '_coverage_match_fast'
-);
-
-features = ee.FeatureCollection(
-  coverageJoinFast.apply(
-    withFireFast,
-    coverageMetricsUnique,
-    ee.Filter.equals({
-      leftField: '_location_year_key_fast',
-      rightField: '_location_year_key_fast'
-    })
-  )
-).map(function(feature) {
-
-  feature = ee.Feature(feature);
-  var match = ee.Feature(
-    feature.get('_coverage_match_fast')
-  );
-
-  var result = feature.set(
-    match.toDictionary(
-      coverageMetricNamesFast
-    )
-  );
-
-  return result.select(
-    result.propertyNames()
-      .remove('_fire_match_fast')
-      .remove('_coverage_match_fast')
-      .remove('_location_key_fast')
-      .remove('_location_year_key_fast')
-  );
-});
-
-// Console diagnostic disabled in full-production export.
-
-
-
-
-// --- --- --- MÉTRICAS DE ACESSIBILIDADE / ANTROPIZAÇÃO
-// ============================================================================
-// DISTÂNCIA À ÁREA URBANIZADA + DENSIDADE DE ESTRADAS
-//
-// URBANO:
-// - MapBiomas Collection 11
-// - classe 24 = Área Urbanizada
-// - usa a classificação do MESMO ANO de Yr_f_f_
-// - distância Euclidiana calculada com ee.Image.distance()
-// - MapBiomas original = 30 m; grade operacional da distância = 120 m
-// - kernel Euclidiano limitado a 30 km
-// - se não houver classe 24 até 30 km:
-//       urban-distance_m = null
-//       urban-distance_gt30km = 1
-//       urban-distance_label = '>30 km'
-//
-// ESTRADAS:
-// - GRIP4 Central-South America
-// - rede viária estática (não anual)
-// - comprimento total de estradas dentro de buffer circular de 1 km
-// - densidade = km de estrada / km² de buffer
-//
-// As métricas são calculadas apenas para combinações únicas:
-// - urbano: localização + ano
-// - estrada: localização
-// e depois associadas novamente a todos os registros.
-// ============================================================================
-
-var accessibilityMapBiomas = ee.Image(
-  'projects/mapbiomas-public/assets/brazil/lulc/collection11/' +
-  'mapbiomas_brazil_collection11_coverage_v3'
-);
-
-var accessibilityRoadsGRIP4 = ee.FeatureCollection(
-  'projects/sat-io/open-datasets/GRIP4/Central-South-America'
-);
-
-var URBAN_CLASS = 24;
-var URBAN_SOURCE_SCALE_M = 30;
-var URBAN_DISTANCE_SCALE_M = 120; // operational grid for 30-km Euclidean kernel
-var URBAN_MAX_DISTANCE_M = 30000;  // 30 km
-
-var ROAD_BUFFER_M = 1000;
-
-// Kernel Euclidiano em metros.
-// ee.Image.distance() mascara pixels cuja distância excede o raio do kernel.
-// At 30 m, a 30-km radius would create a 2001-pixel-wide kernel,
-// exceeding Earth Engine's 512-pixel kernel limit.
-// At 120 m, the same 30-km radius is 250 pixels, i.e. 501 pixels wide.
-var urbanEuclideanKernel = ee.Kernel.euclidean(
-  URBAN_MAX_DISTANCE_M,
-  'meters'
-);
-
-
-// ---------------------------------------------------------------------------
-// CHAVES PARA EVITAR CÁLCULOS REPETIDOS
-// ---------------------------------------------------------------------------
-
-function addAccessibilityKeys(feature) {
-
-  var coords = ee.List(
-    feature.geometry().coordinates()
-  );
-
-  var lon = ee.Number(coords.get(0));
-  var lat = ee.Number(coords.get(1));
-  var year = getSourceInteger(feature, 'Yr_f_f_');
-
-  var locationKey = lon.format('%.6f')
-    .cat('_')
-    .cat(lat.format('%.6f'));
-
-  var accessKey = locationKey
-    .cat('_')
-    .cat(year.format());
-
-  return feature.set({
-    '_access_location_key': locationKey,
-    '_access_year_key': accessKey
-  });
-}
-
-// Lightweight collection used ONLY to determine unique accessibility requests.
-var accessibilityInput = sourceFeatures.map(
-  addAccessibilityKeys
-);
-
-var uniqueAccessibilityLocationYears =
-  accessibilityInput
-    .distinct(['_access_year_key']);
-
-// Road density is date-independent. Include locations whose year/month
-// are missing or 'NA' so those records also get the static road metric.
-function addRoadLocationKey(feature) {
-  feature = ee.Feature(feature);
-  var coords = ee.List(feature.geometry().coordinates());
-  var locationKey = ee.Number(coords.get(0)).format('%.6f')
-    .cat('_')
-    .cat(ee.Number(coords.get(1)).format('%.6f'));
-  return feature.set('_access_location_key', locationKey);
-}
-
-var uniqueAccessibilityLocations = sourceFeaturesRaw
-  .map(addRoadLocationKey)
-  .distinct(['_access_location_key']);
-
-// Add the same keys to the already-enriched output only for the final joins.
-var featuresWithAccessibilityKeys = features.map(
-  addAccessibilityKeys
-);
-
-// Console diagnostic disabled in full-production export.
-
-
-
-// ---------------------------------------------------------------------------
-// 1) DISTÂNCIA EUCLIDIANA À CLASSE 24, LIMITADA A 30 KM
-// ---------------------------------------------------------------------------
-// Para cada ano:
-//   1. seleciona classification_<ano>
-//   2. cria máscara binária de classe 24
-//   3. calcula distância Euclidiana apenas até 30 km
-//   4. amostra somente os pontos daquele ano
-//
-// Não existe cálculo de distância além de 30 km.
-
-var accessibilityYears = ee.List(
-  uniqueAccessibilityLocationYears
-    .aggregate_array('Yr_f_f_')
-).distinct().sort();
-
-var urbanMetricsByYear = ee.FeatureCollection(
-  accessibilityYears.map(function(y) {
-
-    y = ee.Number(y).int();
-
-    var pointsThisYear =
-      uniqueAccessibilityLocationYears.filter(
-        ee.Filter.eq('Yr_f_f_', y)
-      );
-
-    var urbanMask30m = accessibilityMapBiomas
-      .select(
-        ee.String('classification_')
-          .cat(y.format())
-      )
-      .eq(URBAN_CLASS)
-      .unmask(0)
-      .rename('urban');
-
-    // Aggregate the original 30-m MapBiomas urban mask to 120 m.
-    // MAX preserves urban presence: if any 30-m class-24 pixel occurs
-    // inside the 120-m cell, that cell is treated as urban.
-    //
-    // This is necessary because a 30-km Euclidean kernel at 30 m would
-    // be 2001 pixels wide, above Earth Engine's 512-pixel kernel limit.
-    var urbanMask120m = urbanMask30m
-      .reduceResolution({
-        reducer: ee.Reducer.max(),
-        maxPixels: 64
+        return image
+          .select('precip_mm')
+          .multiply(0)
+          .add(image.date().millis())
+          .toDouble()
+          .rename('last_wet_millis')
+          .updateMask(wet);
       })
-      .reproject({
-        crs: urbanMask30m.projection(),
-        scale: URBAN_DISTANCE_SCALE_M
-      })
-      .rename('urban');
+      .max();
 
-    // Euclidean distance is evaluated only up to 30 km.
-    // Pixels farther than 30 km remain masked.
-    var urbanDistance = urbanMask120m
-      .distance(
-        urbanEuclideanKernel,
-        false
-      )
-      .rename('urban-distance_m');
+    var lastWetMillis = reduceRegion_first_climate(
+      lastWetDateImage,
+      geom
+    ).get('last_wet_millis');
 
-    return pointsThisYear.map(function(feature) {
+    return ee.Algorithms.If(
+      ee.Algorithms.IsEqual(lastWetMillis, null),
+      null,
+      pointDate
+        .difference(ee.Date(ee.Number(lastWetMillis)), 'day')
+        .subtract(1)
+        .max(0)
+    );
+  }
 
-      var d = urbanDistance.reduceRegion({
-        reducer: ee.Reducer.first(),
-        geometry: feature.geometry(),
-        scale: URBAN_DISTANCE_SCALE_M,
-        maxPixels: 1e8,
-        tileScale: 8
-      }).get('urban-distance_m');
+  // ---------------------------------------------------------------------------
+  // COMPUTE CLIMATE ONLY FOR UNIQUE POINT + DATE COMBINATIONS
+  // ---------------------------------------------------------------------------
 
-      var beyond30km = ee.Algorithms.IsEqual(
-        d,
-        null
-      );
+  var climateComputed = climateUniqueInput.map(function(feature) {
 
-      return ee.Feature(null, {
-        '_access_year_key':
-          feature.get('_access_year_key'),
+    var geom = feature.geometry();
+    var pointDate = getClimatePointDate(feature);
+    var pointDateEnd = pointDate.advance(1, 'day');
 
-        // Exact numeric distance only when an urban pixel occurs <=30 km.
-        'urban-distance_m':
-          ee.Algorithms.If(
-            beyond30km,
-            null,
-            d
-          ),
+    var year = getSourceInteger(feature, 'Yr_f_f_');
+    var calendarYearStart = ee.Date.fromYMD(year, 1, 1);
+    var calendarYearEnd = calendarYearStart.advance(1, 'year');
 
-        // Useful numeric censoring flag for statistical analysis.
-        'urban-distance_gt30km':
-          ee.Algorithms.If(
-            beyond30km,
-            1,
-            0
-          ),
+    // -------------------------------------------------------------------------
+    // TEMPERATURE: PREVIOUS 30 DAYS
+    // One three-band image + ONE reduceRegion instead of three reductions.
+    // -------------------------------------------------------------------------
 
-        // Human-readable output requested.
-        'urban-distance_label':
-          ee.Algorithms.If(
-            beyond30km,
-            '>30 km',
-            '<=30 km'
-          ),
+    var tempMonthlyCol = hourly
+      .filterDate(pointDate.advance(-30, 'day'), pointDate)
+      .map(select_temperature_celsius_by_hourly)
+      .select('temperature_2m');
 
-        // Metadata describing the operational distance calculation.
-        'urban-distance_resolution_m':
-          URBAN_DISTANCE_SCALE_M,
+    var tempMonthlyStatsImage = ee.Image.cat([
+      tempMonthlyCol.median().rename('temp_monthly_median'),
+      tempMonthlyCol.min().rename('temp_monthly_min'),
+      tempMonthlyCol.max().rename('temp_monthly_max')
+    ]);
 
-        'urban-distance_method':
-          'MapBiomas class 24; Euclidean kernel <=30 km; 120 m operational grid'
-      });
-    });
-  })
-).flatten();
-
-// Console diagnostic disabled in full-production export.
-
-
-
-// ---------------------------------------------------------------------------
-// 2) DENSIDADE DE ESTRADAS GRIP4 NO BUFFER DE 1 KM
-// ---------------------------------------------------------------------------
-// GRIP4 é estático. Portanto esta métrica NÃO varia com Yr_f_f_.
-//
-// Para cada localização única:
-//   - cria buffer circular de 1 km;
-//   - seleciona somente estradas que interceptam o buffer;
-//   - recorta cada linha ao buffer;
-//   - soma o comprimento em metros;
-//   - calcula km de estrada / km² de buffer.
-
-var roadMetricsUnique = uniqueAccessibilityLocations.map(
-  function(feature) {
-
-    var buffer = feature.geometry().buffer(
-      ROAD_BUFFER_M,
-      20
+    var tempMonthlyStats = reduceRegion_first_climate(
+      tempMonthlyStatsImage,
+      geom
     );
 
-    var localRoads = accessibilityRoadsGRIP4
-      .filterBounds(buffer);
+    // -------------------------------------------------------------------------
+    // TEMPERATURE: REFERENCE DAY
+    // One three-band image + ONE reduceRegion.
+    // -------------------------------------------------------------------------
 
-    var roadLengths = localRoads.map(
-      function(road) {
+    var tempDailyCol = hourly
+      .filterDate(pointDate, pointDateEnd)
+      .map(select_temperature_celsius_by_hourly)
+      .select('temperature_2m');
 
-        var clipped = ee.Feature(road)
-          .geometry()
-          .intersection(
-            buffer,
-            20
-          );
+    var tempDailyStatsImage = ee.Image.cat([
+      tempDailyCol.median().rename('temp_daily_median'),
+      tempDailyCol.min().rename('temp_daily_min'),
+      tempDailyCol.max().rename('temp_daily_max')
+    ]);
 
-        return ee.Feature(null, {
-          '_road_length_m':
-            clipped.length(20)
-        });
-      }
+    var tempDailyStats = reduceRegion_first_climate(
+      tempDailyStatsImage,
+      geom
     );
 
-    var totalRoadLengthM = ee.Number(
-      ee.Algorithms.If(
-        localRoads.size().gt(0),
-        roadLengths.aggregate_sum(
-          '_road_length_m'
-        ),
-        0
-      )
+    // -------------------------------------------------------------------------
+    // PRECIPITATION
+    // All five precipitation summaries are stacked and sampled in ONE reduction.
+    // -------------------------------------------------------------------------
+
+    var precipitationStatsImage = ee.Image.cat([
+
+      precipitationDailyMM
+        .filterDate(pointDate.advance(-7, 'day'), pointDate)
+        .sum()
+        .rename('precipitation_1week'),
+
+      precipitationDailyMM
+        .filterDate(pointDate.advance(-3, 'month'), pointDate)
+        .sum()
+        .rename('precipitation_3months'),
+
+      precipitationDailyMM
+        .filterDate(pointDate.advance(-1, 'year'), pointDate)
+        .sum()
+        .rename('precipitation_1year'),
+
+      precipitationMonthlyMM
+        .filterDate(calendarYearStart, calendarYearEnd)
+        .sum()
+        .rename('precip_calendar_year_total_mm'),
+
+      meanAnnualPrecip1991_2020
+        .rename('precip_mean_annual_1991_2020_mm')
+    ]);
+
+    var precipitationStats = reduceRegion_first_climate(
+      precipitationStatsImage,
+      geom
     );
 
-    var bufferAreaKm2 = buffer
-      .area(20)
-      .divide(1e6);
-
-    var roadDensityKmPerKm2 =
-      totalRoadLengthM
-        .divide(1000)
-        .divide(bufferAreaKm2);
+    // Exact preceding dry spell. This remains a separate reduction.
+    var dryDaysBefore = consecutiveDryDaysBefore(
+      feature,
+      pointDate
+    );
 
     return ee.Feature(null, {
-      '_access_location_key':
-        feature.get('_access_location_key'),
+      '_climate_key':
+        feature.get('_climate_key'),
 
-      'road-GRIP4_length_1km_m':
-        totalRoadLengthM,
+      'temp-monthly_median':
+        tempMonthlyStats.get('temp_monthly_median'),
 
-      'road-GRIP4_density_1km_km_per_km2':
-        roadDensityKmPerKm2
+      'temp-monthly_min':
+        tempMonthlyStats.get('temp_monthly_min'),
+
+      'temp-monthly_max':
+        tempMonthlyStats.get('temp_monthly_max'),
+
+      'temp-daily_median':
+        tempDailyStats.get('temp_daily_median'),
+
+      'temp-daily_min':
+        tempDailyStats.get('temp_daily_min'),
+
+      'temp-daily_max':
+        tempDailyStats.get('temp_daily_max'),
+
+      'precipitation_1week':
+        precipitationStats.get('precipitation_1week'),
+
+      'precipitation_3months':
+        precipitationStats.get('precipitation_3months'),
+
+      'precipitation_1year':
+        precipitationStats.get('precipitation_1year'),
+
+      'precip-dry_days_before_reference':
+        dryDaysBefore,
+
+      'precip-calendar_year_total_mm':
+        precipitationStats.get('precip_calendar_year_total_mm'),
+
+      'precip-mean_annual_1991_2020_mm':
+        precipitationStats.get('precip_mean_annual_1991_2020_mm')
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // JOIN CLIMATE METRICS BACK TO ALL ORIGINAL ROWS
+  // ---------------------------------------------------------------------------
+
+  var climateMetricNames = [
+    'temp-monthly_median',
+    'temp-monthly_min',
+    'temp-monthly_max',
+    'temp-daily_median',
+    'temp-daily_min',
+    'temp-daily_max',
+    'precipitation_1week',
+    'precipitation_3months',
+    'precipitation_1year',
+    'precip-dry_days_before_reference',
+    'precip-calendar_year_total_mm',
+    'precip-mean_annual_1991_2020_mm'
+  ];
+
+  var climateJoin = ee.Join.saveFirst('climate_match');
+
+  features = ee.FeatureCollection(
+    climateJoin.apply(
+      featuresWithClimateKey,
+      climateComputed,
+      ee.Filter.equals({
+        leftField: '_climate_key',
+        rightField: '_climate_key'
+      })
+    )
+  ).map(function(feature) {
+    var climateMatch = ee.Feature(feature.get('climate_match'));
+
+    var result = ee.Feature(feature).set(
+      climateMatch.toDictionary(climateMetricNames)
+    );
+
+    // Remove internal helper properties before final CSV export.
+    return result.select(
+      result.propertyNames()
+        .remove('climate_match')
+        .remove('_climate_key')
+    );
+  });
+
+  // Avoid forcing an extra full table/chart evaluation in the Console.
+  // Console diagnostic disabled in full-production export.
+
+
+
+  // --- --- --- HEATWAVES: PRODUCTION, FULL DATASET (no per-point time stack)
+  // ============================================================================
+  // Definition is already embedded in the daily binary MapBiomas asset:
+  // TX90, 1991-2020 climatology, 5-day centered window, >=6 consecutive days.
+  // This implementation never builds a 3,650-band image or iterates through
+  // a 10-year daily list for every fire. Instead, temporal ImageCollection
+  // maximum reductions identify the most recent completed run, and a short
+  // count verifies the inferred run has no missing daily heat-wave pixels.
+  // It keeps the same ten-year lookback, 90-day boundary pad, and output names.
+  // 'Last' means most recent COMPLETED wave, excluding waves ongoing on fire day.
+  // All records and all years are processed together in one Export.table task.
+  // ============================================================================
+  var HEATWAVE_ASSET =
+    'projects/mapbiomas-brazil/assets/DEGRADATION/COLLECTION-11/' +
+    'CLIMATIC_WAVES/heatWaves_v2';
+  var HEATWAVE_LOOKBACK_YEARS = 10;
+  var HEATWAVE_BOUNDARY_PAD_DAYS = 90;
+  var HEATWAVE_EARLIEST_DATE = ee.Date('1985-01-01');
+  var HEATWAVE_SCALE_M = 11132;
+  var HEATWAVE_MS_PER_DAY = 86400000;
+  var HEATWAVE_MIN_DURATION = 6;
+
+  // Build date-index bands, preserving the source pixel projection.
+  // Earth Engine's 'date' asset metadata is a YYYY-MM-dd string.
+  var heatwaveTaggedDays = ee.ImageCollection(HEATWAVE_ASSET)
+    .select('heat_wave')
+    .map(function(image) {
+      image = ee.Image(image);
+      var binary = image.select('heat_wave');
+      var dayIndex = ee.Date(ee.String(image.get('date')))
+        .millis().divide(HEATWAVE_MS_PER_DAY).round();
+      var dayImage = binary.multiply(0).add(dayIndex).toInt();
+      return ee.Image.cat([
+        dayImage.updateMask(binary.eq(1)).rename('heat_day'),
+        dayImage.updateMask(binary.eq(0)).rename('normal_day'),
+        dayImage.updateMask(binary.gte(0).and(binary.lte(1)))
+          .rename('observed_day')
+      ]).copyProperties(image, ['date']);
+    });
+
+  function hwMaxDateImage(collection, bandNames) {
+    // A fully masked fallback preserves band schema for empty date windows.
+    var fallback = ee.Image.constant(
+      bandNames.map(function() { return -1; })
+    ).rename(bandNames).updateMask(ee.Image.constant(0));
+    return collection.select(bandNames)
+      .merge(ee.ImageCollection([fallback])).max();
+  }
+
+  function hwDate(dayIndex) {
+    return ee.Date(ee.Number(dayIndex).multiply(HEATWAVE_MS_PER_DAY));
+  }
+
+  function hwNumOrMinusOne(x) {
+    return ee.Number(ee.Algorithms.If(
+      ee.Algorithms.IsEqual(x, null), -1, x
+    ));
+  }
+
+  function hwSample(image, geometry) {
+    return image.reduceRegion({
+      reducer: ee.Reducer.first(),
+      geometry: geometry,
+      scale: HEATWAVE_SCALE_M,
+      maxPixels: 1e8,
+      tileScale: 8
     });
   }
-);
 
-// Console diagnostic disabled in full-production export.
+  function hwMaxDate(a, b) {
+    return ee.Date(ee.Algorithms.If(
+      ee.Date(a).millis().gte(ee.Date(b).millis()), a, b
+    ));
+  }
 
+  function heatwaveMetricsAtFire(feature) {
+    feature = ee.Feature(feature);
+    var geom = feature.geometry();
+    var focalDate = getClimatePointDate(feature);
+    var focalDay = focalDate.millis().divide(HEATWAVE_MS_PER_DAY).round();
+    var cutoff = hwMaxDate(
+      HEATWAVE_EARLIEST_DATE,
+      focalDate.advance(-HEATWAVE_LOOKBACK_YEARS, 'year')
+    );
+    var readStart = hwMaxDate(
+      HEATWAVE_EARLIEST_DATE,
+      cutoff.advance(-HEATWAVE_BOUNDARY_PAD_DAYS, 'day')
+    );
+    var startText = readStart.format('YYYY-MM-dd');
+    var focalText = focalDate.format('YYYY-MM-dd');
+    var startDay = readStart.millis().divide(HEATWAVE_MS_PER_DAY).round();
+    var cutoffDay = cutoff.millis().divide(HEATWAVE_MS_PER_DAY).round();
 
+    // One raster reduction retrieves both most recent 1, most recent 0,
+    // and most recent observed daily pixel on or before fire day.
+    var beforeFire = heatwaveTaggedDays
+      .filter(ee.Filter.gte('date', startText))
+      .filter(ee.Filter.lte('date', focalText));
+    var latest = hwSample(hwMaxDateImage(beforeFire, [
+      'heat_day', 'normal_day', 'observed_day'
+    ]), geom);
+    var lastOne = hwNumOrMinusOne(latest.get('heat_day'));
+    var lastZero = hwNumOrMinusOne(latest.get('normal_day'));
+    var lastObserved = hwNumOrMinusOne(latest.get('observed_day'));
+    var focalObserved = lastObserved.eq(focalDay);
+    var focalBinary = ee.Algorithms.If(
+      focalObserved,
+      ee.Algorithms.If(lastOne.eq(focalDay), 1, 0),
+      null
+    );
 
-// ---------------------------------------------------------------------------
-// 3) JOIN URBANO + ESTRADAS DE VOLTA A TODOS OS REGISTROS
-// ---------------------------------------------------------------------------
+    // A wave is completed iff an observed normal day comes after its end.
+    // If the fire is inside an ongoing wave, ignore that current run: find
+    // the latest wave day BEFORE the last observed zero.
+    var safeLastZero = lastZero.max(startDay);
+    var oldHeatDay = hwNumOrMinusOne(hwSample(
+      hwMaxDateImage(
+        heatwaveTaggedDays
+          .filter(ee.Filter.gte('date', startText))
+          .filter(ee.Filter.lt('date', hwDate(safeLastZero).format('YYYY-MM-dd'))),
+        ['heat_day']
+      ), geom
+    ).get('heat_day'));
+    var lastCompletedEnd = ee.Number(ee.Algorithms.If(
+      lastOne.gte(0).and(lastZero.gt(lastOne)),
+      lastOne,
+      oldHeatDay
+    ));
 
-// --- urbano: localização + ano
-var urbanJoin = ee.Join.saveFirst(
-  '_urban_match'
-);
+    // Previous observed normal day is the day before the start of a run.
+    var safeEnd = lastCompletedEnd.max(startDay);
+    var previousNormal = hwNumOrMinusOne(hwSample(
+      hwMaxDateImage(
+        heatwaveTaggedDays
+          .filter(ee.Filter.gte('date', startText))
+          .filter(ee.Filter.lt('date', hwDate(safeEnd).format('YYYY-MM-dd'))),
+        ['normal_day']
+      ), geom
+    ).get('normal_day'));
+    var duration = lastCompletedEnd.subtract(previousNormal);
 
-var featuresWithUrban = ee.FeatureCollection(
-  urbanJoin.apply(
-    featuresWithAccessibilityKeys,
-    urbanMetricsByYear,
+    // Cheap boundary verification around the candidate event:
+    //   (a) all interior calendar days must be observed heatwave=1;
+    //   (b) the day immediately after the end must be observed 0.
+    // Missing days are NOT silently interpreted as zeros.
+    var safePreviousNormal = previousNormal.max(startDay.subtract(1));
+    var eventDays = heatwaveTaggedDays
+      .filter(ee.Filter.gt('date', hwDate(safePreviousNormal).format('YYYY-MM-dd')))
+      .filter(ee.Filter.lte('date', hwDate(safeEnd).format('YYYY-MM-dd')));
+    var fallbackHeatBand = ee.Image.constant(-1)
+      .rename('heat_day').updateMask(ee.Image.constant(0));
+    var eventDayCount = eventDays.select('heat_day')
+      .merge(ee.ImageCollection([fallbackHeatBand]))
+      .count().rename('heat_count');
+    var afterDate = hwDate(safeEnd.add(1)).format('YYYY-MM-dd');
+    var nextNormal = hwMaxDateImage(
+      heatwaveTaggedDays.filter(ee.Filter.eq('date', afterDate)),
+      ['normal_day']
+    );
+    var checked = hwSample(ee.Image.cat([eventDayCount, nextNormal]), geom);
+    var nObservedHeatDays = hwNumOrMinusOne(checked.get('heat_count'));
+    var nextZeroDay = hwNumOrMinusOne(checked.get('normal_day'));
+
+    var found = focalObserved
+      .and(lastCompletedEnd.gte(cutoffDay))
+      .and(previousNormal.gte(startDay))
+      .and(duration.gte(HEATWAVE_MIN_DURATION))
+      .and(nObservedHeatDays.eq(duration))
+      .and(nextZeroDay.eq(lastCompletedEnd.add(1)));
+
+    return ee.Feature(null, {
+      '_heatwave_key': feature.get('_heatwave_key'),
+      'Days_since_heatwave': ee.Algorithms.If(
+        found, focalDay.subtract(lastCompletedEnd), null
+      ),
+      'Heatwave_duration': ee.Algorithms.If(found, duration, null),
+      'heatwave_last_start': ee.Algorithms.If(
+        found, hwDate(previousNormal.add(1)).format('YYYY-MM-dd'), null
+      ),
+      'heatwave_last_end': ee.Algorithms.If(
+        found, hwDate(lastCompletedEnd).format('YYYY-MM-dd'), null
+      ),
+      'heatwave_reference_day_binary': focalBinary,
+      'heatwave_reference_day_observed': ee.Number(focalObserved),
+      'heatwave_lookback_years': HEATWAVE_LOOKBACK_YEARS
+    });
+  }
+
+  // Deduplicate identical point/date combinations, matching climate keys.
+  function addHeatwaveKey(feature) {
+    feature = ee.Feature(feature);
+    return feature.set(
+      '_heatwave_key', addClimateKey(feature).get('_climate_key')
+    );
+  }
+  var heatwaveInput = sourceFeatures.map(addHeatwaveKey);
+  var heatwaveUniqueInput = heatwaveInput.distinct(['_heatwave_key']);
+  var heatwaveComputed = heatwaveUniqueInput.map(heatwaveMetricsAtFire);
+  var heatwaveMetricNames = [
+    'Days_since_heatwave',
+    'Heatwave_duration',
+    'heatwave_last_start',
+    'heatwave_last_end',
+    'heatwave_reference_day_binary',
+    'heatwave_reference_day_observed',
+    'heatwave_lookback_years'
+  ];
+
+  var featuresWithHeatwaveKey = features.map(addHeatwaveKey);
+  var heatwaveJoin = ee.Join.saveFirst('_heatwave_match');
+  features = ee.FeatureCollection(heatwaveJoin.apply(
+    featuresWithHeatwaveKey,
+    heatwaveComputed,
     ee.Filter.equals({
-      leftField: '_access_year_key',
-      rightField: '_access_year_key'
+      leftField: '_heatwave_key', rightField: '_heatwave_key'
     })
-  )
-).map(function(feature) {
+  )).map(function(feature) {
+    feature = ee.Feature(feature);
+    var hwProps = ee.Feature(feature.get('_heatwave_match'))
+      .toDictionary(heatwaveMetricNames);
+    var enriched = feature.set(hwProps);
+    return enriched.select(
+      enriched.propertyNames()
+        .remove('_heatwave_key')
+        .remove('_heatwave_match')
+    );
+  });
 
-  feature = ee.Feature(feature);
+  // ============================================================================
+  // END HEATWAVES
+  // ============================================================================
 
-  var match = feature.get('_urban_match');
+  // --- --- --- MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL
+  // ============================================================================
+  // FAST VERSION
+  // Landsat/SMA values depend on point + reference date.
+  // Compute once for each unique point/date, then join back.
+  //
+  // Also fixes the previous server-side day parsing issue:
+  //   day.equals('NA') ? '1' : day
+  // ============================================================================
 
-  var urbanDict = ee.Dictionary(
-    ee.Algorithms.If(
-      ee.Algorithms.IsEqual(match, null),
-      ee.Dictionary({
-        'urban-distance_m': null,
-        'urban-distance_gt30km': null,
-        'urban-distance_label': null,
-        'urban-distance_resolution_m': null,
-        'urban-distance_method': null
-      }),
-      ee.Feature(match).toDictionary([
-        'urban-distance_m',
-        'urban-distance_gt30km',
-        'urban-distance_label',
-        'urban-distance_resolution_m',
-        'urban-distance_method'
-      ])
-    )
+  function getFuelDate(feature) {
+    var year = getSourceInteger(feature, 'Yr_f_f_');
+    var month = getSourceInteger(feature, 'Month');
+    var day = getSourceDay(feature);
+
+    return ee.Date.fromYMD(
+      year,
+      month,
+      day
+    );
+  }
+
+  function addFuelKey(feature) {
+
+    var coords = ee.List(
+      feature.geometry().coordinates()
+    );
+
+    var lon = ee.Number(coords.get(0));
+    var lat = ee.Number(coords.get(1));
+    var date = getFuelDate(feature);
+
+    var key = lon.format('%.6f')
+      .cat('_')
+      .cat(lat.format('%.6f'))
+      .cat('_')
+      .cat(date.format('YYYYMMdd'));
+
+    return feature.set(
+      '_fuel_key',
+      key
+    );
+  }
+
+  // Determine unique Landsat requests from the raw lightweight input only.
+  var fuelInput = sourceFeatures.map(
+    addFuelKey
   );
 
-  return feature.set(urbanDict);
-});
+  var fuelUniqueInput = fuelInput
+    .distinct(['_fuel_key']);
+
+  // Key the accumulated output only for joining the metric table back later.
+  var featuresWithFuelKey = features.map(
+    addFuelKey
+  );
+
+  // Console diagnostic disabled in full-production export.
 
 
-// --- estradas: localização
-var roadJoinAccessibility = ee.Join.saveFirst(
-  '_road_match'
-);
+  // getLandsat() requires year as a client-side JS number because it chooses
+  // the Landsat constellation from a JavaScript dictionary.
+  // Therefore we keep the year loop, but only over UNIQUE point/date records.
+  var fuelComputedList = years.map(function(year) {
 
-features = ee.FeatureCollection(
-  roadJoinAccessibility.apply(
-    featuresWithUrban,
-    roadMetricsUnique,
-    ee.Filter.equals({
-      leftField: '_access_location_key',
-      rightField: '_access_location_key'
-    })
-  )
-).map(function(feature) {
+    return fuelUniqueInput
+      .filter(
+        ee.Filter.eq(
+          'Yr_f_f_',
+          year
+        )
+      )
+      .map(function(feature) {
 
-  feature = ee.Feature(feature);
+        var month = getSourceInteger(feature, 'Month');
 
-  var match = feature.get('_road_match');
+        var day = getSourceDay(feature);
 
-  var roadDict = ee.Dictionary(
-    ee.Algorithms.If(
+        var landsatYearCollection =
+          getLandsat(
+            year,
+            month,
+            day,
+            feature
+          );
+
+        // Do NOT unmask here.
+        // If the Landsat composite has no valid observation at the point,
+        // the SMA value should remain null rather than being converted to 0.
+        var fuelBands = landsatYearCollection
+          .reduceRegion({
+            reducer: ee.Reducer.first(),
+            geometry: feature.geometry(),
+            scale: scale,
+            maxPixels: 1e13,
+            tileScale: 8
+          });
+
+        return ee.Feature(null, {
+          '_fuel_key':
+            feature.get('_fuel_key'),
+
+          'SMA-npv':
+            fuelBands.get('npv'),
+
+          'SMA-gv':
+            fuelBands.get('gv'),
+
+          'SMA-soil':
+            fuelBands.get('soil'),
+
+          'SMA-cloud':
+            fuelBands.get('cloud'),
+
+          'SMA-shade':
+            fuelBands.get('shade'),
+
+          'SMA_gvs':
+            fuelBands.get('gvs'),
+
+          'SMA_npvSoil':
+            fuelBands.get('npvSoil')
+        });
+      });
+  });
+
+  var fuelComputed = ee.FeatureCollection(
+    fuelComputedList
+  ).flatten();
+
+  var fuelMetricNames = [
+    'SMA-npv',
+    'SMA-gv',
+    'SMA-soil',
+    'SMA-cloud',
+    'SMA-shade',
+    'SMA_gvs',
+    'SMA_npvSoil'
+  ];
+
+  var fuelJoin = ee.Join.saveFirst(
+    '_fuel_match'
+  );
+
+  features = ee.FeatureCollection(
+    fuelJoin.apply(
+      featuresWithFuelKey,
+      fuelComputed,
+      ee.Filter.equals({
+        leftField: '_fuel_key',
+        rightField: '_fuel_key'
+      })
+    )
+  ).map(function(feature) {
+
+    feature = ee.Feature(feature);
+
+    var match = ee.Feature(
+      feature.get('_fuel_match')
+    );
+
+    var result = feature.set(
+      match.toDictionary(
+        fuelMetricNames
+      )
+    );
+
+    return result.select(
+      result.propertyNames()
+        .remove('_fuel_key')
+        .remove('_fuel_match')
+    );
+  });
+
+  // Console diagnostic disabled in full-production export.
+
+
+
+
+  // --- --- --- MÉTRICAS DE KG/M² DOS COMPARTIMENTOS DE CARBONO
+
+  var qcn_kg_m2 = ee.Image('projects/ee-ipam/assets/CCAL/public/qcn/qcn_brazil_historical_biomass_carbon_qcn_rect_v1')
+    .select(['TOTAL','AGB','BGB','CDW','LITTER'],['QCN-total','QCN-agb','QCN-bgb','QCN-cdw','QCN-litter']).divide(10);
+  // Append date-invalid rows without inventing date-dependent values.
+  // They receive static GRIP4 road metrics and QCN carbon below.
+  var undatedWithRoads = ee.FeatureCollection(
+    roadJoinAccessibility.apply(
+      undatedSourceFeatures.map(addRoadLocationKey),
+      roadMetricsUnique,
+      ee.Filter.equals({
+        leftField: '_access_location_key',
+        rightField: '_access_location_key'
+      })
+    )
+  ).map(function(feature) {
+    feature = ee.Feature(feature);
+    var match = feature.get('_road_match');
+    var roadDict = ee.Dictionary(ee.Algorithms.If(
       ee.Algorithms.IsEqual(match, null),
       ee.Dictionary({
         'road-GRIP4_length_1km_m': null,
@@ -880,1377 +1716,647 @@ features = ee.FeatureCollection(
         'road-GRIP4_length_1km_m',
         'road-GRIP4_density_1km_km_per_km2'
       ])
-    )
-  );
-
-  var result = feature.set(roadDict);
-
-  // Remove propriedades internas usadas somente nos joins.
-  return result.select(
-    result.propertyNames()
+    ));
+    var result = feature.set(roadDict);
+    return result.select(result.propertyNames()
       .remove('_access_location_key')
-      .remove('_access_year_key')
-      .remove('_urban_match')
-      .remove('_road_match')
-  );
-});
-
-// Console diagnostic disabled in full-production export.
-
-
-
-
-// --- --- --- MÉTRICAS DE CLIMA
-// FAST VERSION:
-// 1) compute climate only once for each UNIQUE point + reference date;
-// 2) use ERA5-Land MONTHLY_AGGR for calendar-year and 1991-2020 precipitation;
-// 3) keep the exact 10-year search for the preceding dry spell;
-// 4) heatwaves are calculated separately from the supplied daily binary dataset.
-
-var climateScale = 11132;
-var DRY_DAY_THRESHOLD_MM = 1.0;
-var DRY_LOOKBACK_YEARS = 10;
-
-var hourly = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY');
-var daily = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR');
-var monthly = ee.ImageCollection('ECMWF/ERA5_LAND/MONTHLY_AGGR');
-
-// ---------------------------------------------------------------------------
-// HELPERS
-// ---------------------------------------------------------------------------
-
-function select_temperature_celsius_by_hourly(image) {
-  return image
-    .select('temperature_2m')
-    .subtract(273.15)
-    .rename('temperature_2m');
-}
-
-function reduceRegion_first_climate(image, geom) {
-  return image.reduceRegion({
-    reducer: ee.Reducer.first(),
-    geometry: geom,
-    scale: climateScale,
-    maxPixels: 1e13,
-    tileScale: 8
-  });
-}
-
-function getClimatePointDate(feature) {
-  var year = getSourceInteger(feature, 'Yr_f_f_');
-  var month = getSourceInteger(feature, 'Month');
-  var day = getSourceDay(feature);
-
-  return ee.Date.fromYMD(year, month, day);
-}
-
-// ---------------------------------------------------------------------------
-// PRECIPITATION IN MILLIMETRES
-// ---------------------------------------------------------------------------
-
-var precipitationDailyMM = daily.map(function(image) {
-  return image
-    .select('total_precipitation_sum')
-    .multiply(1000)
-    .max(0)
-    .rename('precip_mm')
-    .copyProperties(image, ['system:time_start']);
-});
-
-// MONTHLY_AGGR already contains the monthly sum of flow variables.
-// This is much cheaper for long climatological/calendar-year calculations.
-var precipitationMonthlyMM = monthly.map(function(image) {
-  return image
-    .select('total_precipitation_sum')
-    .multiply(1000)
-    .max(0)
-    .rename('precip_mm')
-    .copyProperties(image, ['system:time_start']);
-});
-
-// 360 monthly images rather than ~10,958 daily images.
-var meanAnnualPrecip1991_2020 = precipitationMonthlyMM
-  .filterDate('1991-01-01', '2021-01-01')
-  .sum()
-  .divide(30)
-  .rename('precip_mean_annual_1991_2020_mm');
-
-// ---------------------------------------------------------------------------
-// ADD A CLIMATE KEY AND REMOVE DUPLICATE CLIMATE REQUESTS
-// ---------------------------------------------------------------------------
-// Climate values depend only on:
-//   point geometry + reference date.
-//
-// Many rows in the source table have the same point/date. Compute those once
-// and join the resulting climate properties back to every original row.
-
-function addClimateKey(feature) {
-  var coords = ee.List(feature.geometry().coordinates());
-  var lon = ee.Number(coords.get(0));
-  var lat = ee.Number(coords.get(1));
-  var date = getClimatePointDate(feature);
-
-  var key = lon.format('%.6f')
-    .cat('_')
-    .cat(lat.format('%.6f'))
-    .cat('_')
-    .cat(date.format('YYYYMMdd'));
-
-  return feature.set('_climate_key', key);
-}
-
-// Determine unique climate requests from the lightweight source table.
-var climateInput = sourceFeatures.map(
-  addClimateKey
-);
-
-var climateUniqueInput = climateInput
-  .distinct(['_climate_key']);
-
-// Add the same key to the enriched output only for the final join.
-var featuresWithClimateKey = features.map(
-  addClimateKey
-);
-
-// Console diagnostic disabled in full-production export.
-
-
-// ---------------------------------------------------------------------------
-// CONSECUTIVE DRY DAYS IMMEDIATELY BEFORE REFERENCE DATE
-// ---------------------------------------------------------------------------
-// Exact configured lookback is retained: 10 years.
-// Only unique point/date combinations are evaluated.
-
-function consecutiveDryDaysBefore(feature, pointDate) {
-  var geom = feature.geometry();
-  var searchStart = pointDate.advance(-DRY_LOOKBACK_YEARS, 'year');
-
-  var lastWetDateImage = precipitationDailyMM
-    .filterDate(searchStart, pointDate)
-    .map(function(image) {
-      var wet = image.select('precip_mm')
-        .gte(DRY_DAY_THRESHOLD_MM);
-
-      return image
-        .select('precip_mm')
-        .multiply(0)
-        .add(image.date().millis())
-        .toDouble()
-        .rename('last_wet_millis')
-        .updateMask(wet);
-    })
-    .max();
-
-  var lastWetMillis = reduceRegion_first_climate(
-    lastWetDateImage,
-    geom
-  ).get('last_wet_millis');
-
-  return ee.Algorithms.If(
-    ee.Algorithms.IsEqual(lastWetMillis, null),
-    null,
-    pointDate
-      .difference(ee.Date(ee.Number(lastWetMillis)), 'day')
-      .subtract(1)
-      .max(0)
-  );
-}
-
-// ---------------------------------------------------------------------------
-// COMPUTE CLIMATE ONLY FOR UNIQUE POINT + DATE COMBINATIONS
-// ---------------------------------------------------------------------------
-
-var climateComputed = climateUniqueInput.map(function(feature) {
-
-  var geom = feature.geometry();
-  var pointDate = getClimatePointDate(feature);
-  var pointDateEnd = pointDate.advance(1, 'day');
-
-  var year = getSourceInteger(feature, 'Yr_f_f_');
-  var calendarYearStart = ee.Date.fromYMD(year, 1, 1);
-  var calendarYearEnd = calendarYearStart.advance(1, 'year');
-
-  // -------------------------------------------------------------------------
-  // TEMPERATURE: PREVIOUS 30 DAYS
-  // One three-band image + ONE reduceRegion instead of three reductions.
-  // -------------------------------------------------------------------------
-
-  var tempMonthlyCol = hourly
-    .filterDate(pointDate.advance(-30, 'day'), pointDate)
-    .map(select_temperature_celsius_by_hourly)
-    .select('temperature_2m');
-
-  var tempMonthlyStatsImage = ee.Image.cat([
-    tempMonthlyCol.median().rename('temp_monthly_median'),
-    tempMonthlyCol.min().rename('temp_monthly_min'),
-    tempMonthlyCol.max().rename('temp_monthly_max')
-  ]);
-
-  var tempMonthlyStats = reduceRegion_first_climate(
-    tempMonthlyStatsImage,
-    geom
-  );
-
-  // -------------------------------------------------------------------------
-  // TEMPERATURE: REFERENCE DAY
-  // One three-band image + ONE reduceRegion.
-  // -------------------------------------------------------------------------
-
-  var tempDailyCol = hourly
-    .filterDate(pointDate, pointDateEnd)
-    .map(select_temperature_celsius_by_hourly)
-    .select('temperature_2m');
-
-  var tempDailyStatsImage = ee.Image.cat([
-    tempDailyCol.median().rename('temp_daily_median'),
-    tempDailyCol.min().rename('temp_daily_min'),
-    tempDailyCol.max().rename('temp_daily_max')
-  ]);
-
-  var tempDailyStats = reduceRegion_first_climate(
-    tempDailyStatsImage,
-    geom
-  );
-
-  // -------------------------------------------------------------------------
-  // PRECIPITATION
-  // All five precipitation summaries are stacked and sampled in ONE reduction.
-  // -------------------------------------------------------------------------
-
-  var precipitationStatsImage = ee.Image.cat([
-
-    precipitationDailyMM
-      .filterDate(pointDate.advance(-7, 'day'), pointDate)
-      .sum()
-      .rename('precipitation_1week'),
-
-    precipitationDailyMM
-      .filterDate(pointDate.advance(-3, 'month'), pointDate)
-      .sum()
-      .rename('precipitation_3months'),
-
-    precipitationDailyMM
-      .filterDate(pointDate.advance(-1, 'year'), pointDate)
-      .sum()
-      .rename('precipitation_1year'),
-
-    precipitationMonthlyMM
-      .filterDate(calendarYearStart, calendarYearEnd)
-      .sum()
-      .rename('precip_calendar_year_total_mm'),
-
-    meanAnnualPrecip1991_2020
-      .rename('precip_mean_annual_1991_2020_mm')
-  ]);
-
-  var precipitationStats = reduceRegion_first_climate(
-    precipitationStatsImage,
-    geom
-  );
-
-  // Exact preceding dry spell. This remains a separate reduction.
-  var dryDaysBefore = consecutiveDryDaysBefore(
-    feature,
-    pointDate
-  );
-
-  return ee.Feature(null, {
-    '_climate_key':
-      feature.get('_climate_key'),
-
-    'temp-monthly_median':
-      tempMonthlyStats.get('temp_monthly_median'),
-
-    'temp-monthly_min':
-      tempMonthlyStats.get('temp_monthly_min'),
-
-    'temp-monthly_max':
-      tempMonthlyStats.get('temp_monthly_max'),
-
-    'temp-daily_median':
-      tempDailyStats.get('temp_daily_median'),
-
-    'temp-daily_min':
-      tempDailyStats.get('temp_daily_min'),
-
-    'temp-daily_max':
-      tempDailyStats.get('temp_daily_max'),
-
-    'precipitation_1week':
-      precipitationStats.get('precipitation_1week'),
-
-    'precipitation_3months':
-      precipitationStats.get('precipitation_3months'),
-
-    'precipitation_1year':
-      precipitationStats.get('precipitation_1year'),
-
-    'precip-dry_days_before_reference':
-      dryDaysBefore,
-
-    'precip-calendar_year_total_mm':
-      precipitationStats.get('precip_calendar_year_total_mm'),
-
-    'precip-mean_annual_1991_2020_mm':
-      precipitationStats.get('precip_mean_annual_1991_2020_mm')
-  });
-});
-
-// ---------------------------------------------------------------------------
-// JOIN CLIMATE METRICS BACK TO ALL ORIGINAL ROWS
-// ---------------------------------------------------------------------------
-
-var climateMetricNames = [
-  'temp-monthly_median',
-  'temp-monthly_min',
-  'temp-monthly_max',
-  'temp-daily_median',
-  'temp-daily_min',
-  'temp-daily_max',
-  'precipitation_1week',
-  'precipitation_3months',
-  'precipitation_1year',
-  'precip-dry_days_before_reference',
-  'precip-calendar_year_total_mm',
-  'precip-mean_annual_1991_2020_mm'
-];
-
-var climateJoin = ee.Join.saveFirst('climate_match');
-
-features = ee.FeatureCollection(
-  climateJoin.apply(
-    featuresWithClimateKey,
-    climateComputed,
-    ee.Filter.equals({
-      leftField: '_climate_key',
-      rightField: '_climate_key'
-    })
-  )
-).map(function(feature) {
-  var climateMatch = ee.Feature(feature.get('climate_match'));
-
-  var result = ee.Feature(feature).set(
-    climateMatch.toDictionary(climateMetricNames)
-  );
-
-  // Remove internal helper properties before final CSV export.
-  return result.select(
-    result.propertyNames()
-      .remove('climate_match')
-      .remove('_climate_key')
-  );
-});
-
-// Avoid forcing an extra full table/chart evaluation in the Console.
-// Console diagnostic disabled in full-production export.
-
-
-
-// --- --- --- HEATWAVES: PRODUCTION, FULL DATASET (no per-point time stack)
-// ============================================================================
-// Definition is already embedded in the daily binary MapBiomas asset:
-// TX90, 1991-2020 climatology, 5-day centered window, >=6 consecutive days.
-// This implementation never builds a 3,650-band image or iterates through
-// a 10-year daily list for every fire. Instead, temporal ImageCollection
-// maximum reductions identify the most recent completed run, and a short
-// count verifies the inferred run has no missing daily heat-wave pixels.
-// It keeps the same ten-year lookback, 90-day boundary pad, and output names.
-// 'Last' means most recent COMPLETED wave, excluding waves ongoing on fire day.
-// All records and all years are processed together in one Export.table task.
-// ============================================================================
-var HEATWAVE_ASSET =
-  'projects/mapbiomas-brazil/assets/DEGRADATION/COLLECTION-11/' +
-  'CLIMATIC_WAVES/heatWaves_v2';
-var HEATWAVE_LOOKBACK_YEARS = 10;
-var HEATWAVE_BOUNDARY_PAD_DAYS = 90;
-var HEATWAVE_EARLIEST_DATE = ee.Date('1985-01-01');
-var HEATWAVE_SCALE_M = 11132;
-var HEATWAVE_MS_PER_DAY = 86400000;
-var HEATWAVE_MIN_DURATION = 6;
-
-// Build date-index bands, preserving the source pixel projection.
-// Earth Engine's 'date' asset metadata is a YYYY-MM-dd string.
-var heatwaveTaggedDays = ee.ImageCollection(HEATWAVE_ASSET)
-  .select('heat_wave')
-  .map(function(image) {
-    image = ee.Image(image);
-    var binary = image.select('heat_wave');
-    var dayIndex = ee.Date(ee.String(image.get('date')))
-      .millis().divide(HEATWAVE_MS_PER_DAY).round();
-    var dayImage = binary.multiply(0).add(dayIndex).toInt();
-    return ee.Image.cat([
-      dayImage.updateMask(binary.eq(1)).rename('heat_day'),
-      dayImage.updateMask(binary.eq(0)).rename('normal_day'),
-      dayImage.updateMask(binary.gte(0).and(binary.lte(1)))
-        .rename('observed_day')
-    ]).copyProperties(image, ['date']);
+      .remove('_road_match'));
   });
 
-function hwMaxDateImage(collection, bandNames) {
-  // A fully masked fallback preserves band schema for empty date windows.
-  var fallback = ee.Image.constant(
-    bandNames.map(function() { return -1; })
-  ).rename(bandNames).updateMask(ee.Image.constant(0));
-  return collection.select(bandNames)
-    .merge(ee.ImageCollection([fallback])).max();
-}
+  // Row preservation: dated rows + undated rows = original source rows.
+  features = features.merge(undatedWithRoads);
 
-function hwDate(dayIndex) {
-  return ee.Date(ee.Number(dayIndex).multiply(HEATWAVE_MS_PER_DAY));
-}
-
-function hwNumOrMinusOne(x) {
-  return ee.Number(ee.Algorithms.If(
-    ee.Algorithms.IsEqual(x, null), -1, x
-  ));
-}
-
-function hwSample(image, geometry) {
-  return image.reduceRegion({
-    reducer: ee.Reducer.first(),
-    geometry: geometry,
-    scale: HEATWAVE_SCALE_M,
-    maxPixels: 1e8,
-    tileScale: 8
+  // MEMORY PATCH 2026-11-17 (v3): avoid a single collection-wide
+  // reduceRegions() over the fully-enriched, deeply-joined fire table.
+  // Google Earth Engine's recommended fallback for large reductions is
+  // per-feature reduceRegion(), which lets each point be handled separately.
+  // Raster and output band names, scale, and first-pixel reducer are unchanged.
+  features = features.map(function(feature) {
+    feature = ee.Feature(feature);
+    var qcnAtPoint = qcn_kg_m2.reduceRegion({
+      reducer: ee.Reducer.first(),
+      geometry: feature.geometry(),
+      scale: 30,
+      maxPixels: 1e8,
+      tileScale: 8
+    });
+    return feature.set(qcnAtPoint);
   });
-}
+  
 
-function hwMaxDate(a, b) {
-  return ee.Date(ee.Algorithms.If(
-    ee.Date(a).millis().gte(ee.Date(b).millis()), a, b
-  ));
-}
 
-function heatwaveMetricsAtFire(feature) {
-  feature = ee.Feature(feature);
-  var geom = feature.geometry();
-  var focalDate = getClimatePointDate(feature);
-  var focalDay = focalDate.millis().divide(HEATWAVE_MS_PER_DAY).round();
-  var cutoff = hwMaxDate(
-    HEATWAVE_EARLIEST_DATE,
-    focalDate.advance(-HEATWAVE_LOOKBACK_YEARS, 'year')
-  );
-  var readStart = hwMaxDate(
-    HEATWAVE_EARLIEST_DATE,
-    cutoff.advance(-HEATWAVE_BOUNDARY_PAD_DAYS, 'day')
-  );
-  var startText = readStart.format('YYYY-MM-dd');
-  var focalText = focalDate.format('YYYY-MM-dd');
-  var startDay = readStart.millis().divide(HEATWAVE_MS_PER_DAY).round();
-  var cutoffDay = cutoff.millis().divide(HEATWAVE_MS_PER_DAY).round();
-
-  // One raster reduction retrieves both most recent 1, most recent 0,
-  // and most recent observed daily pixel on or before fire day.
-  var beforeFire = heatwaveTaggedDays
-    .filter(ee.Filter.gte('date', startText))
-    .filter(ee.Filter.lte('date', focalText));
-  var latest = hwSample(hwMaxDateImage(beforeFire, [
-    'heat_day', 'normal_day', 'observed_day'
-  ]), geom);
-  var lastOne = hwNumOrMinusOne(latest.get('heat_day'));
-  var lastZero = hwNumOrMinusOne(latest.get('normal_day'));
-  var lastObserved = hwNumOrMinusOne(latest.get('observed_day'));
-  var focalObserved = lastObserved.eq(focalDay);
-  var focalBinary = ee.Algorithms.If(
-    focalObserved,
-    ee.Algorithms.If(lastOne.eq(focalDay), 1, 0),
-    null
-  );
-
-  // A wave is completed iff an observed normal day comes after its end.
-  // If the fire is inside an ongoing wave, ignore that current run: find
-  // the latest wave day BEFORE the last observed zero.
-  var safeLastZero = lastZero.max(startDay);
-  var oldHeatDay = hwNumOrMinusOne(hwSample(
-    hwMaxDateImage(
-      heatwaveTaggedDays
-        .filter(ee.Filter.gte('date', startText))
-        .filter(ee.Filter.lt('date', hwDate(safeLastZero).format('YYYY-MM-dd'))),
-      ['heat_day']
-    ), geom
-  ).get('heat_day'));
-  var lastCompletedEnd = ee.Number(ee.Algorithms.If(
-    lastOne.gte(0).and(lastZero.gt(lastOne)),
-    lastOne,
-    oldHeatDay
-  ));
-
-  // Previous observed normal day is the day before the start of a run.
-  var safeEnd = lastCompletedEnd.max(startDay);
-  var previousNormal = hwNumOrMinusOne(hwSample(
-    hwMaxDateImage(
-      heatwaveTaggedDays
-        .filter(ee.Filter.gte('date', startText))
-        .filter(ee.Filter.lt('date', hwDate(safeEnd).format('YYYY-MM-dd'))),
-      ['normal_day']
-    ), geom
-  ).get('normal_day'));
-  var duration = lastCompletedEnd.subtract(previousNormal);
-
-  // Cheap boundary verification around the candidate event:
-  //   (a) all interior calendar days must be observed heatwave=1;
-  //   (b) the day immediately after the end must be observed 0.
-  // Missing days are NOT silently interpreted as zeros.
-  var safePreviousNormal = previousNormal.max(startDay.subtract(1));
-  var eventDays = heatwaveTaggedDays
-    .filter(ee.Filter.gt('date', hwDate(safePreviousNormal).format('YYYY-MM-dd')))
-    .filter(ee.Filter.lte('date', hwDate(safeEnd).format('YYYY-MM-dd')));
-  var fallbackHeatBand = ee.Image.constant(-1)
-    .rename('heat_day').updateMask(ee.Image.constant(0));
-  var eventDayCount = eventDays.select('heat_day')
-    .merge(ee.ImageCollection([fallbackHeatBand]))
-    .count().rename('heat_count');
-  var afterDate = hwDate(safeEnd.add(1)).format('YYYY-MM-dd');
-  var nextNormal = hwMaxDateImage(
-    heatwaveTaggedDays.filter(ee.Filter.eq('date', afterDate)),
-    ['normal_day']
-  );
-  var checked = hwSample(ee.Image.cat([eventDayCount, nextNormal]), geom);
-  var nObservedHeatDays = hwNumOrMinusOne(checked.get('heat_count'));
-  var nextZeroDay = hwNumOrMinusOne(checked.get('normal_day'));
-
-  var found = focalObserved
-    .and(lastCompletedEnd.gte(cutoffDay))
-    .and(previousNormal.gte(startDay))
-    .and(duration.gte(HEATWAVE_MIN_DURATION))
-    .and(nObservedHeatDays.eq(duration))
-    .and(nextZeroDay.eq(lastCompletedEnd.add(1)));
-
-  return ee.Feature(null, {
-    '_heatwave_key': feature.get('_heatwave_key'),
-    'Days_since_heatwave': ee.Algorithms.If(
-      found, focalDay.subtract(lastCompletedEnd), null
-    ),
-    'Heatwave_duration': ee.Algorithms.If(found, duration, null),
-    'heatwave_last_start': ee.Algorithms.If(
-      found, hwDate(previousNormal.add(1)).format('YYYY-MM-dd'), null
-    ),
-    'heatwave_last_end': ee.Algorithms.If(
-      found, hwDate(lastCompletedEnd).format('YYYY-MM-dd'), null
-    ),
-    'heatwave_reference_day_binary': focalBinary,
-    'heatwave_reference_day_observed': ee.Number(focalObserved),
-    'heatwave_lookback_years': HEATWAVE_LOOKBACK_YEARS
+  // Retain the original feature ID and batch number so the CSVs can be
+  // checked for missing or duplicate source records when concatenated.
+  var batchText = ('0000' + (batchIndex + 1)).slice(-4);
+  var totalText = ('0000' + totalBatches).slice(-4);
+  var description = OUTPUT_PREFIX + '_B' + batchText + '_of' + totalText;
+  Export.table.toDrive({
+    collection: features,
+    description: description,
+    folder: 'fire-fapesp',
+    fileNamePrefix: description,
+    fileFormat: 'CSV'
   });
-}
 
-// Deduplicate identical point/date combinations, matching climate keys.
-function addHeatwaveKey(feature) {
-  feature = ee.Feature(feature);
-  return feature.set(
-    '_heatwave_key', addClimateKey(feature).get('_climate_key')
-  );
-}
-var heatwaveInput = sourceFeatures.map(addHeatwaveKey);
-var heatwaveUniqueInput = heatwaveInput.distinct(['_heatwave_key']);
-var heatwaveComputed = heatwaveUniqueInput.map(heatwaveMetricsAtFire);
-var heatwaveMetricNames = [
-  'Days_since_heatwave',
-  'Heatwave_duration',
-  'heatwave_last_start',
-  'heatwave_last_end',
-  'heatwave_reference_day_binary',
-  'heatwave_reference_day_observed',
-  'heatwave_lookback_years'
-];
+  // --- --- --- --- --- FUNÇÕES AUXILIARES
+  // --- --- --- GRAFICO DE TABELA GENERICO
+  function makeTableChart(fc, columns, axisColumn, pageSize) {
+    var selected = fc.select(columns);
+    var chart;
 
-var featuresWithHeatwaveKey = features.map(addHeatwaveKey);
-var heatwaveJoin = ee.Join.saveFirst('_heatwave_match');
-features = ee.FeatureCollection(heatwaveJoin.apply(
-  featuresWithHeatwaveKey,
-  heatwaveComputed,
-  ee.Filter.equals({
-    leftField: '_heatwave_key', rightField: '_heatwave_key'
-  })
-)).map(function(feature) {
-  feature = ee.Feature(feature);
-  var hwProps = ee.Feature(feature.get('_heatwave_match'))
-    .toDictionary(heatwaveMetricNames);
-  var enriched = feature.set(hwProps);
-  return enriched.select(
-    enriched.propertyNames()
-      .remove('_heatwave_key')
-      .remove('_heatwave_match')
-  );
-});
+    if (axisColumn) {
+      chart = ui.Chart.feature.byFeature(selected, axisColumn);
+    } else {
+      chart = ui.Chart.feature.byFeature(selected);
+    }
 
-// ============================================================================
-// END HEATWAVES
-// ============================================================================
-
-// --- --- --- MÉTRICAS DE ACUMULO DE MATERIAL COMBUSTIVEL
-// ============================================================================
-// FAST VERSION
-// Landsat/SMA values depend on point + reference date.
-// Compute once for each unique point/date, then join back.
-//
-// Also fixes the previous server-side day parsing issue:
-//   day.equals('NA') ? '1' : day
-// ============================================================================
-
-function getFuelDate(feature) {
-  var year = getSourceInteger(feature, 'Yr_f_f_');
-  var month = getSourceInteger(feature, 'Month');
-  var day = getSourceDay(feature);
-
-  return ee.Date.fromYMD(
-    year,
-    month,
-    day
-  );
-}
-
-function addFuelKey(feature) {
-
-  var coords = ee.List(
-    feature.geometry().coordinates()
-  );
-
-  var lon = ee.Number(coords.get(0));
-  var lat = ee.Number(coords.get(1));
-  var date = getFuelDate(feature);
-
-  var key = lon.format('%.6f')
-    .cat('_')
-    .cat(lat.format('%.6f'))
-    .cat('_')
-    .cat(date.format('YYYYMMdd'));
-
-  return feature.set(
-    '_fuel_key',
-    key
-  );
-}
-
-// Determine unique Landsat requests from the raw lightweight input only.
-var fuelInput = sourceFeatures.map(
-  addFuelKey
-);
-
-var fuelUniqueInput = fuelInput
-  .distinct(['_fuel_key']);
-
-// Key the accumulated output only for joining the metric table back later.
-var featuresWithFuelKey = features.map(
-  addFuelKey
-);
-
-// Console diagnostic disabled in full-production export.
-
-
-// getLandsat() requires year as a client-side JS number because it chooses
-// the Landsat constellation from a JavaScript dictionary.
-// Therefore we keep the year loop, but only over UNIQUE point/date records.
-var fuelComputedList = years.map(function(year) {
-
-  return fuelUniqueInput
-    .filter(
-      ee.Filter.eq(
-        'Yr_f_f_',
-        year
-      )
-    )
-    .map(function(feature) {
-
-      var month = getSourceInteger(feature, 'Month');
-
-      var day = getSourceDay(feature);
-
-      var landsatYearCollection =
-        getLandsat(
-          year,
-          month,
-          day,
-          feature
-        );
-
-      // Do NOT unmask here.
-      // If the Landsat composite has no valid observation at the point,
-      // the SMA value should remain null rather than being converted to 0.
-      var fuelBands = landsatYearCollection
-        .reduceRegion({
-          reducer: ee.Reducer.first(),
-          geometry: feature.geometry(),
-          scale: scale,
-          maxPixels: 1e13,
-          tileScale: 8
-        });
-
-      return ee.Feature(null, {
-        '_fuel_key':
-          feature.get('_fuel_key'),
-
-        'SMA-npv':
-          fuelBands.get('npv'),
-
-        'SMA-gv':
-          fuelBands.get('gv'),
-
-        'SMA-soil':
-          fuelBands.get('soil'),
-
-        'SMA-cloud':
-          fuelBands.get('cloud'),
-
-        'SMA-shade':
-          fuelBands.get('shade'),
-
-        'SMA_gvs':
-          fuelBands.get('gvs'),
-
-        'SMA_npvSoil':
-          fuelBands.get('npvSoil')
+    chart
+      .setChartType('Table')
+      .setOptions({
+        page: 'enable',
+        pageSize: pageSize || 300
       });
-    });
-});
 
-var fuelComputed = ee.FeatureCollection(
-  fuelComputedList
-).flatten();
+    chart.style().set({ stretch: 'horizontal', maxHeight:'300px' });
 
-var fuelMetricNames = [
-  'SMA-npv',
-  'SMA-gv',
-  'SMA-soil',
-  'SMA-cloud',
-  'SMA-shade',
-  'SMA_gvs',
-  'SMA_npvSoil'
-];
-
-var fuelJoin = ee.Join.saveFirst(
-  '_fuel_match'
-);
-
-features = ee.FeatureCollection(
-  fuelJoin.apply(
-    featuresWithFuelKey,
-    fuelComputed,
-    ee.Filter.equals({
-      leftField: '_fuel_key',
-      rightField: '_fuel_key'
-    })
-  )
-).map(function(feature) {
-
-  feature = ee.Feature(feature);
-
-  var match = ee.Feature(
-    feature.get('_fuel_match')
-  );
-
-  var result = feature.set(
-    match.toDictionary(
-      fuelMetricNames
-    )
-  );
-
-  return result.select(
-    result.propertyNames()
-      .remove('_fuel_key')
-      .remove('_fuel_match')
-  );
-});
-
-// Console diagnostic disabled in full-production export.
-
-
-
-
-// --- --- --- MÉTRICAS DE KG/M² DOS COMPARTIMENTOS DE CARBONO
-
-var qcn_kg_m2 = ee.Image('projects/ee-ipam/assets/CCAL/public/qcn/qcn_brazil_historical_biomass_carbon_qcn_rect_v1')
-  .select(['TOTAL','AGB','BGB','CDW','LITTER'],['QCN-total','QCN-agb','QCN-bgb','QCN-cdw','QCN-litter']).divide(10);
-// Append date-invalid rows without inventing date-dependent values.
-// They receive static GRIP4 road metrics and QCN carbon below.
-var undatedWithRoads = ee.FeatureCollection(
-  roadJoinAccessibility.apply(
-    undatedSourceFeatures.map(addRoadLocationKey),
-    roadMetricsUnique,
-    ee.Filter.equals({
-      leftField: '_access_location_key',
-      rightField: '_access_location_key'
-    })
-  )
-).map(function(feature) {
-  feature = ee.Feature(feature);
-  var match = feature.get('_road_match');
-  var roadDict = ee.Dictionary(ee.Algorithms.If(
-    ee.Algorithms.IsEqual(match, null),
-    ee.Dictionary({
-      'road-GRIP4_length_1km_m': null,
-      'road-GRIP4_density_1km_km_per_km2': null
-    }),
-    ee.Feature(match).toDictionary([
-      'road-GRIP4_length_1km_m',
-      'road-GRIP4_density_1km_km_per_km2'
-    ])
-  ));
-  var result = feature.set(roadDict);
-  return result.select(result.propertyNames()
-    .remove('_access_location_key')
-    .remove('_road_match'));
-});
-
-// Row preservation: dated rows + undated rows = original source rows.
-features = features.merge(undatedWithRoads);
-
-// MEMORY PATCH 2026-11-17 (v3): avoid a single collection-wide
-// reduceRegions() over the fully-enriched, deeply-joined fire table.
-// Google Earth Engine's recommended fallback for large reductions is
-// per-feature reduceRegion(), which lets each point be handled separately.
-// Raster and output band names, scale, and first-pixel reducer are unchanged.
-features = features.map(function(feature) {
-  feature = ee.Feature(feature);
-  var qcnAtPoint = qcn_kg_m2.reduceRegion({
-    reducer: ee.Reducer.first(),
-    geometry: feature.geometry(),
-    scale: 30,
-    maxPixels: 1e8,
-    tileScale: 8
-  });
-  return feature.set(qcnAtPoint);
-});
-  
-
-
-var description = '2026-11-17-tabFato-stats-memoryV3';
-var folder = 'fire-fapesp';
-Export.table.toDrive({
-  collection:features,
-  description:description,
-  folder:folder,
-  fileNamePrefix:description,
-  fileFormat:'csv',
-  // selectors:,
-  // maxVertices:,
-  // priority:
-})
-                          
-// --- --- --- --- --- FUNÇÕES AUXILIARES
-// --- --- --- GRAFICO DE TABELA GENERICO
-function makeTableChart(fc, columns, axisColumn, pageSize) {
-  var selected = fc.select(columns);
-  var chart;
-
-  if (axisColumn) {
-    chart = ui.Chart.feature.byFeature(selected, axisColumn);
-  } else {
-    chart = ui.Chart.feature.byFeature(selected);
+    return chart;
   }
 
-  chart
-    .setChartType('Table')
-    .setOptions({
-      page: 'enable',
-      pageSize: pageSize || 300
+  // preparar coleção de imagens do ano landsat solicitado
+  function getLandsat(year,month,day,point){
+    // -------------------------------------------------------------------
+    // DATASETS (LANDSAT COLLECTION 2 T1 L2)
+    // -------------------------------------------------------------------
+    // Load the block list module for Landsat
+
+    var datasets = {
+      // LANDSAT COLLECTION 02 TIER 1 LEVEL 2
+      LC08: {
+        address: 'LANDSAT/LC08/C02/T1_L2',
+        pre_processings: function (col) {
+          return col
+            // .filter(ee.Filter.inList('system:index', blockList_landsat).not())
+            .map(function (image) {
+              image = clipBoard_Landsat(image);
+              image = corrections_LS89_col2(image);
+              image = fractions(image);
+              return image;
+            });
+        },
+      },
+      LC09: {
+        address: 'LANDSAT/LC09/C02/T1_L2',
+        pre_processings: function (col) {
+          return col
+            // .filter(ee.Filter.inList('system:index', blockList_landsat).not())
+            .map(function (image) {
+              image = clipBoard_Landsat(image);
+              image = corrections_LS89_col2(image);
+              image = fractions(image);
+              return image;
+            });
+        },
+      },
+      LT05: {
+        address: 'LANDSAT/LT05/C02/T1_L2',
+        pre_processings: function (col) {
+          return col
+            // .filter(ee.Filter.inList('system:index', blockList_landsat).not())
+            .map(function (image) {
+              image = clipBoard_Landsat(image);
+              image = corrections_LS57_col2(image);
+              image = fractions(image);
+              return image;
+            });
+        },
+      },
+      LE07: {
+        address: 'LANDSAT/LE07/C02/T1_L2',
+        pre_processings: function (col) {
+          return col
+            // .filter(ee.Filter.inList('system:index', blockList_landsat).not())
+            .map(function (image) {
+              image = clipBoard_Landsat(image);
+              image = corrections_LS57_col2(image);
+              image = fractions(image);
+              return image;
+            });
+        },
+      },
+    };
+  
+    var yearToConstelation = {
+      1985: ['LT05'],
+      1986: ['LT05'],
+      1987: ['LT05'],
+      1988: ['LT05'],
+      1989: ['LT05'],
+      1990: ['LT05'],
+      1991: ['LT05'],
+      1992: ['LT05'],
+      1993: ['LT05'],
+      1994: ['LT05'],
+      1995: ['LT05'],
+      1996: ['LT05'],
+      1997: ['LT05'],
+      1998: ['LT05'],
+  
+      1999: ['LT05', 'LE07'],
+      2000: ['LT05', 'LE07'],
+      2001: ['LT05', 'LE07'],
+      2002: ['LT05', 'LE07'],
+      2003: ['LT05', 'LE07'],
+      2004: ['LT05', 'LE07'],
+      2005: ['LT05', 'LE07'],
+      2006: ['LT05', 'LE07'],
+      2007: ['LT05', 'LE07'],
+      2008: ['LT05', 'LE07'],
+      2009: ['LT05', 'LE07'],
+      2010: ['LT05', 'LE07'],
+      2011: ['LT05', 'LE07'],
+      2012: ['LT05', 'LE07'],
+  
+      2013: ['LE07', 'LC08'],
+      2014: ['LE07', 'LC08'],
+      2015: ['LE07', 'LC08'],
+      2016: ['LE07', 'LC08'],
+      2017: ['LE07', 'LC08'],
+      2018: ['LE07', 'LC08'],
+      2019: ['LE07', 'LC08'],
+      2020: ['LE07', 'LC08'],
+      2021: ['LE07', 'LC08'],
+  
+      2022: ['LC09', 'LC08'],
+      2023: ['LC09', 'LC08'],
+      2024: ['LC09', 'LC08'],
+      2025: ['LC09', 'LC08']
+
+    };
+  
+    var constelations = yearToConstelation[year];
+  
+    var images;
+    // print(year,month,day,point)
+    var end = ee.Date.fromYMD(ee.Number(year).int(), ee.Number(month).int(), ee.Number(day).int());
+    var start = end.advance(-3,'month');  
+    constelations.forEach(function(constelation){
+      var obj = datasets[constelation];
+      var imgs = obj.pre_processings(
+        ee.ImageCollection(obj.address)
+          .filterBounds(point.geometry())
+          .filterDate(start, end)
+      );
+      images = images === undefined? imgs : images.merge(imgs);
     });
-
-  chart.style().set({ stretch: 'horizontal', maxHeight:'300px' });
-
-  return chart;
-}
-
-// preparar coleção de imagens do ano landsat solicitado
-function getLandsat(year,month,day,point){
-  // -------------------------------------------------------------------
-  // DATASETS (LANDSAT COLLECTION 2 T1 L2)
-  // -------------------------------------------------------------------
-  // Load the block list module for Landsat
-
-  var datasets = {
-    // LANDSAT COLLECTION 02 TIER 1 LEVEL 2
-    LC08: {
-      address: 'LANDSAT/LC08/C02/T1_L2',
-      pre_processings: function (col) {
-        return col
-          // .filter(ee.Filter.inList('system:index', blockList_landsat).not())
-          .map(function (image) {
-            image = clipBoard_Landsat(image);
-            image = corrections_LS89_col2(image);
-            image = fractions(image);
-            return image;
-          });
-      },
-    },
-    LC09: {
-      address: 'LANDSAT/LC09/C02/T1_L2',
-      pre_processings: function (col) {
-        return col
-          // .filter(ee.Filter.inList('system:index', blockList_landsat).not())
-          .map(function (image) {
-            image = clipBoard_Landsat(image);
-            image = corrections_LS89_col2(image);
-            image = fractions(image);
-            return image;
-          });
-      },
-    },
-    LT05: {
-      address: 'LANDSAT/LT05/C02/T1_L2',
-      pre_processings: function (col) {
-        return col
-          // .filter(ee.Filter.inList('system:index', blockList_landsat).not())
-          .map(function (image) {
-            image = clipBoard_Landsat(image);
-            image = corrections_LS57_col2(image);
-            image = fractions(image);
-            return image;
-          });
-      },
-    },
-    LE07: {
-      address: 'LANDSAT/LE07/C02/T1_L2',
-      pre_processings: function (col) {
-        return col
-          // .filter(ee.Filter.inList('system:index', blockList_landsat).not())
-          .map(function (image) {
-            image = clipBoard_Landsat(image);
-            image = corrections_LS57_col2(image);
-            image = fractions(image);
-            return image;
-          });
-      },
-    },
-  };
   
-  var yearToConstelation = {
-    1985: ['LT05'],
-    1986: ['LT05'],
-    1987: ['LT05'],
-    1988: ['LT05'],
-    1989: ['LT05'],
-    1990: ['LT05'],
-    1991: ['LT05'],
-    1992: ['LT05'],
-    1993: ['LT05'],
-    1994: ['LT05'],
-    1995: ['LT05'],
-    1996: ['LT05'],
-    1997: ['LT05'],
-    1998: ['LT05'],
-  
-    1999: ['LT05', 'LE07'],
-    2000: ['LT05', 'LE07'],
-    2001: ['LT05', 'LE07'],
-    2002: ['LT05', 'LE07'],
-    2003: ['LT05', 'LE07'],
-    2004: ['LT05', 'LE07'],
-    2005: ['LT05', 'LE07'],
-    2006: ['LT05', 'LE07'],
-    2007: ['LT05', 'LE07'],
-    2008: ['LT05', 'LE07'],
-    2009: ['LT05', 'LE07'],
-    2010: ['LT05', 'LE07'],
-    2011: ['LT05', 'LE07'],
-    2012: ['LT05', 'LE07'],
-  
-    2013: ['LE07', 'LC08'],
-    2014: ['LE07', 'LC08'],
-    2015: ['LE07', 'LC08'],
-    2016: ['LE07', 'LC08'],
-    2017: ['LE07', 'LC08'],
-    2018: ['LE07', 'LC08'],
-    2019: ['LE07', 'LC08'],
-    2020: ['LE07', 'LC08'],
-    2021: ['LE07', 'LC08'],
-  
-    2022: ['LC09', 'LC08'],
-    2023: ['LC09', 'LC08'],
-    2024: ['LC09', 'LC08'],
-    2025: ['LC09', 'LC08']
+    // Keep only the bands actually exported by the fuel block.
+    var fuelBandNames = [
+      'npv',
+      'gv',
+      'soil',
+      'cloud',
+      'shade',
+      'gvs',
+      'npvSoil'
+    ];
 
-  };
-  
-  var constelations = yearToConstelation[year];
-  
-  var images;
-  // print(year,month,day,point)
-  var end = ee.Date.fromYMD(ee.Number(year).int(), ee.Number(month).int(), ee.Number(day).int());
-  var start = end.advance(-3,'month');  
-  constelations.forEach(function(constelation){
-    var obj = datasets[constelation];
-    var imgs = obj.pre_processings(
-      ee.ImageCollection(obj.address)
-        .filterBounds(point.geometry())
-        .filterDate(start, end)
-    );
-    images = images === undefined? imgs : images.merge(imgs);
-  });
-  
-  // Keep only the bands actually exported by the fuel block.
-  var fuelBandNames = [
-    'npv',
-    'gv',
-    'soil',
-    'cloud',
-    'shade',
-    'gvs',
-    'npvSoil'
-  ];
-
-  var fuelImages = images.select(
-    fuelBandNames
-  );
-
-  // Robust fallback for an empty Landsat collection.
-  //
-  // An empty ImageCollection reduced with median() can produce an image
-  // with zero bands. Later operations then fail because the expected SMA
-  // schema no longer exists.
-  //
-  // Add one fully masked 7-band image. It contributes no valid pixels when
-  // real Landsat observations exist, but guarantees that the median image
-  // always has the expected seven band names.
-  var emptyFuelImage = ee.Image.constant([
-      0, 0, 0, 0, 0, 0, 0
-    ])
-    .rename(fuelBandNames)
-    .updateMask(
-      ee.Image.constant(0)
+    var fuelImages = images.select(
+      fuelBandNames
     );
 
-  fuelImages = fuelImages.merge(
-    ee.ImageCollection([
-      emptyFuelImage
-    ])
-  );
+    // Robust fallback for an empty Landsat collection.
+    //
+    // An empty ImageCollection reduced with median() can produce an image
+    // with zero bands. Later operations then fail because the expected SMA
+    // schema no longer exists.
+    //
+    // Add one fully masked 7-band image. It contributes no valid pixels when
+    // real Landsat observations exist, but guarantees that the median image
+    // always has the expected seven band names.
+    var emptyFuelImage = ee.Image.constant([
+        0, 0, 0, 0, 0, 0, 0
+      ])
+      .rename(fuelBandNames)
+      .updateMask(
+        ee.Image.constant(0)
+      );
 
-  return fuelImages.median();
+    fuelImages = fuelImages.merge(
+      ee.ImageCollection([
+        emptyFuelImage
+      ])
+    );
+
+    return fuelImages.median();
   
   
-  // -------------------------------------------------------------------
-  // --- Functions for cloud masking, radiometric corrections
+    // -------------------------------------------------------------------
+    // --- Functions for cloud masking, radiometric corrections
   
-  function corrections_LS89_col2(image) {
-    // Radiometric correction for optical bands
-    var opticalBands = image.select('SR_B.*').multiply(0.0000275).add(-0.2);
-    opticalBands = opticalBands.multiply(10000)
-      .subtract(0.0000275 * 0.2 * 1e5 * 100)
-      .round()
-      .divide(10000);
+    function corrections_LS89_col2(image) {
+      // Radiometric correction for optical bands
+      var opticalBands = image.select('SR_B.*').multiply(0.0000275).add(-0.2);
+      opticalBands = opticalBands.multiply(10000)
+        .subtract(0.0000275 * 0.2 * 1e5 * 100)
+        .round()
+        .divide(10000);
   
-    // Radiometric correction for thermal bands
-    var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+      // Radiometric correction for thermal bands
+      var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
   
-    // Return the image with corrected bands
-    image = image.addBands(opticalBands, null, true).addBands(thermalBands, null, true);
+      // Return the image with corrected bands
+      image = image.addBands(opticalBands, null, true).addBands(thermalBands, null, true);
   
-    // Cloud masking
-    var qa = image.select('QA_PIXEL');
-    var cloud = qa.bitwiseAnd(1 << 3)
-      .and(qa.bitwiseAnd(1 << 9))
-      .or(qa.bitwiseAnd(1 << 4));
-    var good_pixel = qa.bitwiseAnd(1 << 6).or(qa.bitwiseAnd(1 << 7));
+      // Cloud masking
+      var qa = image.select('QA_PIXEL');
+      var cloud = qa.bitwiseAnd(1 << 3)
+        .and(qa.bitwiseAnd(1 << 9))
+        .or(qa.bitwiseAnd(1 << 4));
+      var good_pixel = qa.bitwiseAnd(1 << 6).or(qa.bitwiseAnd(1 << 7));
   
-    var radsatQA = image.select('QA_RADSAT');
-    var saturated = radsatQA.bitwiseAnd(1 << 0).or(radsatQA.bitwiseAnd(1 << 1))
-      .or(radsatQA.bitwiseAnd(1 << 2)).or(radsatQA.bitwiseAnd(1 << 3))
-      .or(radsatQA.bitwiseAnd(1 << 4)).or(radsatQA.bitwiseAnd(1 << 5))
-      .or(radsatQA.bitwiseAnd(1 << 6));
+      var radsatQA = image.select('QA_RADSAT');
+      var saturated = radsatQA.bitwiseAnd(1 << 0).or(radsatQA.bitwiseAnd(1 << 1))
+        .or(radsatQA.bitwiseAnd(1 << 2)).or(radsatQA.bitwiseAnd(1 << 3))
+        .or(radsatQA.bitwiseAnd(1 << 4)).or(radsatQA.bitwiseAnd(1 << 5))
+        .or(radsatQA.bitwiseAnd(1 << 6));
   
-    var negative_mask = image.select(['SR_B1']).gt(0).and(
-      image.select(['SR_B2']).gt(0)).and(
-      image.select(['SR_B3']).gt(0)).and(
-      image.select(['SR_B4']).gt(0)).and(
-      image.select(['SR_B5']).gt(0)).and(
-      image.select(['SR_B7']).gt(0));
-  
-    image = image
-      .updateMask(cloud.not())
-      .updateMask(good_pixel)
-      .updateMask(saturated.not())
-      .updateMask(negative_mask);
-  
-    // Correction of band names to default
-    var oldBands = ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'];
-    var newBands = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2'];
-  
-    image = image.select(oldBands, newBands);
-  
-    return image.float();
-  }
-  
-  // - Function for cloud and radiometric correction for Landsat 5 and 7 images
-  function corrections_LS57_col2 (image){
-    var opticalBands = image.select('SR_B.*').multiply(0.0000275).add(-0.2);
-    var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
-    
-    image = image.addBands(opticalBands, null, true)
-                .addBands(thermalBands, null, true);
-                
-    // mascara de nuvem
-    var cloudShadowBitMask = (1 << 3);
-    var cloudsBitMask = (1 << 5);
-  
-    var qa = image.select('QA_PIXEL');
-    var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
-        .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
-  
-    // mascara de ruídos, saturação radiométrica
-    function bitwiseExtract(value, fromBit, toBit) {
-      if (toBit === undefined)
-        toBit = fromBit;
-      var maskSize = ee.Number(1).add(toBit).subtract(fromBit);
-      var mask = ee.Number(1).leftShift(maskSize).subtract(1);
-      return value.rightShift(fromBit).bitwiseAnd(mask);
-    }
-  
-    var clear = bitwiseExtract(qa, 6); // 1 if clear
-    var water = bitwiseExtract(qa, 7); // 1 if water
-  
-    var radsatQA = image.select('QA_RADSAT');
-    var band5Saturated = bitwiseExtract(radsatQA, 4); // 0 if band 5 is not saturated
-    var anySaturated = bitwiseExtract(radsatQA, 0, 6); // 0 if no bands are saturated
-  
-    var mask_saturation = clear
-      .or(water)
-      .and(anySaturated.not());
-    
-    // is visible bands with negative reflectance? 
-    var negative_mask = image.select(['SR_B1']).gt(0).and(
-      image.select(['SR_B2']).gt(0)).and(
+      var negative_mask = image.select(['SR_B1']).gt(0).and(
+        image.select(['SR_B2']).gt(0)).and(
         image.select(['SR_B3']).gt(0)).and(
-          image.select(['SR_B4']).gt(0)).and(
-            image.select(['SR_B5']).gt(0)).and(
-              image.select(['SR_B7']).gt(0));
-    
-    image = image
-      .updateMask(mask)
-      .updateMask(mask_saturation)
-      .updateMask(negative_mask);
+        image.select(['SR_B4']).gt(0)).and(
+        image.select(['SR_B5']).gt(0)).and(
+        image.select(['SR_B7']).gt(0));
   
-    var oldBands = ['SR_B1','SR_B2','SR_B3','SR_B4','SR_B5','SR_B7'];
-    var newBands = ['blue','green','red','nir','swir1','swir2'];
-    image = image.select(oldBands,newBands);
+      image = image
+        .updateMask(cloud.not())
+        .updateMask(good_pixel)
+        .updateMask(saturated.not())
+        .updateMask(negative_mask);
   
-    return image.float();
-  }
+      // Correction of band names to default
+      var oldBands = ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'];
+      var newBands = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2'];
   
-  // -------------------------------------------------------------------
-  // Function to calculate spectral mixture (opcional, não usado no mosaico final)
-  function fractions(image) {
-    var newBands = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2'];
+      image = image.select(oldBands, newBands);
   
-    // Select bands and multiply by 10000
-    var imageSelected = image.select(newBands).multiply(10000);
-  
-    // Atmospheric coefficients
-    var atm = [805.6, 458.1, 286.8, 168.3, 46.8, 26.6];
-  
-    // Define endmembers for spectral mixture analysis
-    var GV = [119.0, 475.0, 169.0, 6250.0, 2399.0, 675.0];
-    var NPV = [1514.0, 1597.0, 1421.0, 3053.0, 7707.0, 1975.0];
-    var Soil = [1799.0, 2479.0, 3158.0, 5437.0, 7707.0, 6646.0];
-    var Cloud = [4031.0, 8714.0, 7900.0, 8989.0, 7002.0, 6607.0];
-  
-    // Spectral mixture analysis
-    var sma = imageSelected.unmix([GV, NPV, Soil, Cloud])
-      .max(0)
-      .multiply(100)
-      .int16();
-  
-    // Rename and add bands
-    sma = image
-      .addBands(sma.select('band_0').rename("gv"))
-      .addBands(sma.select('band_1').rename("npv"))
-      .addBands(sma.select('band_2').rename("soil"))
-      .addBands(sma.select('band_3').rename("cloud"));
-  
-    // Calculate summed values
-    var summed = sma.expression('GV + NPV + SOIL + CLOUD', {
-      GV: sma.select('gv'),
-      NPV: sma.select('npv'),
-      SOIL: sma.select('soil'),
-      CLOUD: sma.select('cloud')
-    });
-  
-    // Shade, GVS, NPV + Soil + Cloud
-    var shade = summed.subtract(100).abs();
-    var gvs = (sma.select(['gv']).divide(summed)).multiply(100);
-    var npvSoil = sma.select(['gv']).add(sma.select(['soil'])).add(sma.select('cloud'));
-  
-    return sma
-      .addBands(shade.rename("shade"))
-      .addBands(npvSoil.rename("npvSoil"))
-      .addBands(gvs.rename("gvs"));
-  }
-  
-  // -------------------------------------------------------------------
-  // Add band with normalized burned ratio (NBR)
-  function addBand_NBR(image) {
-    var exp = '( b("nir") - b("swir2") ) / ( b("nir") + b("swir2") )';
-    var minimoNBR = image
-      .expression(exp)
-      // .add(1)
-      .multiply(100)
-      .multiply(-1)
-      .int16()
-      .rename("nbr");
-    return image.addBands(minimoNBR);
-  }
-  
-  // Function to clip border of images
-  function clipBoard_Landsat(image) {
-    return image.updateMask(
-      ee.Image().paint(image.geometry().buffer(-3000)).eq(0)
-    );
-  }
-
-}
-
-function getCoverageMapBiomas(levelsRequested) {
-
-  var coverage = ee.Image('projects/mapbiomas-public/assets/brazil/lulc/collection11/mapbiomas_brazil_collection11_coverage_v3');
-
-  // Dicionário de legendas por nível
-  var legend_coverage = {
-    nivel0: {
-      3: 'Natural',
-      15: 'Antrópico',
-      33: 'Corpo D’água',
-      27: 'Não observado'
-    },
-    nivel1: {
-      1: 'Floresta',
-      10: 'Vegetação Herbácea e Arbustiva',
-      14: 'Agropecuária',
-      22: 'Área não Vegetada',
-      26: 'Corpo D’água',
-      27: 'Não observado'
-    },
-    nivel2: {
-      3:  'Formação Florestal',
-      4:  'Formação Savânica',
-      5:  'Mangue',
-      6:  'Floresta Alagável',
-      49: 'Restinga Arbórea',
-
-      11: 'Campo Alagado e Área Pantanosa',
-      12: 'Formação Campestre',
-      32: 'Apicum',
-      29: 'Afloramento Rochoso',
-      50: 'Restinga Herbácea',
-
-      15: 'Pastagem',
-      18: 'Agricultura',
-
-      9:  'Silvicultura',
-      21: 'Mosaico de Usos',
-
-      23: 'Praia, Duna e Areal',
-      24: 'Área Urbanizada',
-      30: 'Mineração',
-      75: 'Usina Fotovoltaica (beta)',
-      25: 'Outras Áreas não Vegetadas',
-
-      33: 'Rio, Lago e Oceano',
-      31: 'Aquicultura',
-
-      27: 'Não observado'
-    },
-    nivel3: {
-      3: 'Formação Florestal',
-      4: 'Formação Savânica',
-      5: 'Mangue',
-      6: 'Floresta Alagável',
-      49: 'Restinga Arbórea',
-
-      11: 'Campo Alagado e Área Pantanosa',
-      12: 'Formação Campestre',
-      32: 'Apicum',
-      29: 'Afloramento Rochoso',
-      50: 'Restinga Herbácea',
-
-      15: 'Pastagem',
-      19: 'Lavoura Temporária',
-      36: 'Lavoura Perene',
-
-      9:  'Silvicultura',
-      21: 'Mosaico de Usos',
-
-      23: 'Praia, Duna e Areal',
-      24: 'Área Urbanizada',
-      30: 'Mineração',
-      75: 'Usina Fotovoltaica (beta)',
-      25: 'Outras Áreas não Vegetadas',
-
-      33: 'Rio, Lago e Oceano',
-      31: 'Aquicultura',
-
-      27: 'Não observado'
-    },
-    nivel4: {
-      3:  'Formação Florestal',
-      4:  'Formação Savânica',
-      5:  'Mangue',
-      6:  'Floresta Alagável',
-      49: 'Restinga Arbórea',
-      11: 'Campo Alagado e Área Pantanosa',
-      12: 'Formação Campestre',
-      32: 'Apicum',
-      29: 'Afloramento Rochoso',
-      50: 'Restinga Herbácea',
-      15: 'Pastagem',
-      39: 'Soja',
-      20: 'Cana',
-      40: 'Arroz',
-      62: 'Algodão (beta)',
-      41: 'Outras Lavouras Temporárias',
-      46: 'Café',
-      47: 'Citrus',
-      35: 'Dendê',
-      48: 'Outras Lavouras Perenes',
-      9:  'Silvicultura',
-      21: 'Mosaico de Usos',
-      23: 'Praia, Duna e Areal',
-      24: 'Área Urbanizada',
-      30: 'Mineração',
-      75: 'Usina Fotovoltaica (beta)',
-      25: 'Outras Áreas não Vegetadas',
-      33: 'Rio, Lago e Oceano',
-      31: 'Aquicultura',
-      27: 'Não observado',
-      0:  'Sem dado'
+      return image.float();
     }
-  };
+  
+    // - Function for cloud and radiometric correction for Landsat 5 and 7 images
+    function corrections_LS57_col2 (image){
+      var opticalBands = image.select('SR_B.*').multiply(0.0000275).add(-0.2);
+      var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+    
+      image = image.addBands(opticalBands, null, true)
+                  .addBands(thermalBands, null, true);
+                
+      // mascara de nuvem
+      var cloudShadowBitMask = (1 << 3);
+      var cloudsBitMask = (1 << 5);
+  
+      var qa = image.select('QA_PIXEL');
+      var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+          .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+  
+      // mascara de ruídos, saturação radiométrica
+      function bitwiseExtract(value, fromBit, toBit) {
+        if (toBit === undefined)
+          toBit = fromBit;
+        var maskSize = ee.Number(1).add(toBit).subtract(fromBit);
+        var mask = ee.Number(1).leftShift(maskSize).subtract(1);
+        return value.rightShift(fromBit).bitwiseAnd(mask);
+      }
+  
+      var clear = bitwiseExtract(qa, 6); // 1 if clear
+      var water = bitwiseExtract(qa, 7); // 1 if water
+  
+      var radsatQA = image.select('QA_RADSAT');
+      var band5Saturated = bitwiseExtract(radsatQA, 4); // 0 if band 5 is not saturated
+      var anySaturated = bitwiseExtract(radsatQA, 0, 6); // 0 if no bands are saturated
+  
+      var mask_saturation = clear
+        .or(water)
+        .and(anySaturated.not());
+    
+      // is visible bands with negative reflectance? 
+      var negative_mask = image.select(['SR_B1']).gt(0).and(
+        image.select(['SR_B2']).gt(0)).and(
+          image.select(['SR_B3']).gt(0)).and(
+            image.select(['SR_B4']).gt(0)).and(
+              image.select(['SR_B5']).gt(0)).and(
+                image.select(['SR_B7']).gt(0));
+    
+      image = image
+        .updateMask(mask)
+        .updateMask(mask_saturation)
+        .updateMask(negative_mask);
+  
+      var oldBands = ['SR_B1','SR_B2','SR_B3','SR_B4','SR_B5','SR_B7'];
+      var newBands = ['blue','green','red','nir','swir1','swir2'];
+      image = image.select(oldBands,newBands);
+  
+      return image.float();
+    }
+  
+    // -------------------------------------------------------------------
+    // Function to calculate spectral mixture (opcional, não usado no mosaico final)
+    function fractions(image) {
+      var newBands = ['blue', 'green', 'red', 'nir', 'swir1', 'swir2'];
+  
+      // Select bands and multiply by 10000
+      var imageSelected = image.select(newBands).multiply(10000);
+  
+      // Atmospheric coefficients
+      var atm = [805.6, 458.1, 286.8, 168.3, 46.8, 26.6];
+  
+      // Define endmembers for spectral mixture analysis
+      var GV = [119.0, 475.0, 169.0, 6250.0, 2399.0, 675.0];
+      var NPV = [1514.0, 1597.0, 1421.0, 3053.0, 7707.0, 1975.0];
+      var Soil = [1799.0, 2479.0, 3158.0, 5437.0, 7707.0, 6646.0];
+      var Cloud = [4031.0, 8714.0, 7900.0, 8989.0, 7002.0, 6607.0];
+  
+      // Spectral mixture analysis
+      var sma = imageSelected.unmix([GV, NPV, Soil, Cloud])
+        .max(0)
+        .multiply(100)
+        .int16();
+  
+      // Rename and add bands
+      sma = image
+        .addBands(sma.select('band_0').rename("gv"))
+        .addBands(sma.select('band_1').rename("npv"))
+        .addBands(sma.select('band_2').rename("soil"))
+        .addBands(sma.select('band_3').rename("cloud"));
+  
+      // Calculate summed values
+      var summed = sma.expression('GV + NPV + SOIL + CLOUD', {
+        GV: sma.select('gv'),
+        NPV: sma.select('npv'),
+        SOIL: sma.select('soil'),
+        CLOUD: sma.select('cloud')
+      });
+  
+      // Shade, GVS, NPV + Soil + Cloud
+      var shade = summed.subtract(100).abs();
+      var gvs = (sma.select(['gv']).divide(summed)).multiply(100);
+      var npvSoil = sma.select(['gv']).add(sma.select(['soil'])).add(sma.select('cloud'));
+  
+      return sma
+        .addBands(shade.rename("shade"))
+        .addBands(npvSoil.rename("npvSoil"))
+        .addBands(gvs.rename("gvs"));
+    }
+  
+    // -------------------------------------------------------------------
+    // Add band with normalized burned ratio (NBR)
+    function addBand_NBR(image) {
+      var exp = '( b("nir") - b("swir2") ) / ( b("nir") + b("swir2") )';
+      var minimoNBR = image
+        .expression(exp)
+        // .add(1)
+        .multiply(100)
+        .multiply(-1)
+        .int16()
+        .rename("nbr");
+      return image.addBands(minimoNBR);
+    }
+  
+    // Function to clip border of images
+    function clipBoard_Landsat(image) {
+      return image.updateMask(
+        ee.Image().paint(image.geometry().buffer(-3000)).eq(0)
+      );
+    }
 
-  // Arrays da reclassificação
-  var oldValues = [3, 4, 5, 6, 49, 11, 12, 32, 29, 50, 15, 39, 20, 40, 62, 41, 46, 47, 35, 48, 9, 21, 23, 24, 30, 75, 25, 33, 31, 27, 0];
-  var newValuesByLevel = {
-    nivel4: oldValues,
-    nivel3: [3, 4, 5, 6, 49, 11, 12, 32, 29, 50, 15, 19, 19, 19, 19, 19, 36, 36, 36, 36, 9, 21, 23, 24, 30, 75, 25, 33, 31, 27, 27],
-    nivel2: [3, 4, 5, 6, 49, 11, 12, 32, 29, 50, 15, 18, 18, 18, 18, 18, 18, 18, 18, 18, 9, 21, 23, 24, 30, 75, 25, 33, 31, 27, 27],
-    nivel1: [1, 1, 1, 1, 1, 10, 10, 10, 10, 10, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 22, 22, 22, 22, 22, 26, 26, 27, 27],
-    nivel0: [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 33, 15, 27, 27]
-  };
-
-  // Se não passar argumento → retorna todos os níveis
-  if (!levelsRequested || levelsRequested.length === 0) {
-    levelsRequested = ['nivel0', 'nivel1', 'nivel2', 'nivel3', 'nivel4'];
   }
 
-  // Função de reclassificação
-  function reclass(img, oldVals, newVals) {
-    var out = img.multiply(0);
-    oldVals.forEach(function(v, i) {
-      out = out.where(img.eq(v), newVals[i]);
+  function getCoverageMapBiomas(levelsRequested) {
+
+    var coverage = ee.Image('projects/mapbiomas-public/assets/brazil/lulc/collection11/mapbiomas_brazil_collection11_coverage_v3');
+
+    // Dicionário de legendas por nível
+    var legend_coverage = {
+      nivel0: {
+        3: 'Natural',
+        15: 'Antrópico',
+        33: 'Corpo D’água',
+        27: 'Não observado'
+      },
+      nivel1: {
+        1: 'Floresta',
+        10: 'Vegetação Herbácea e Arbustiva',
+        14: 'Agropecuária',
+        22: 'Área não Vegetada',
+        26: 'Corpo D’água',
+        27: 'Não observado'
+      },
+      nivel2: {
+        3:  'Formação Florestal',
+        4:  'Formação Savânica',
+        5:  'Mangue',
+        6:  'Floresta Alagável',
+        49: 'Restinga Arbórea',
+
+        11: 'Campo Alagado e Área Pantanosa',
+        12: 'Formação Campestre',
+        32: 'Apicum',
+        29: 'Afloramento Rochoso',
+        50: 'Restinga Herbácea',
+
+        15: 'Pastagem',
+        18: 'Agricultura',
+
+        9:  'Silvicultura',
+        21: 'Mosaico de Usos',
+
+        23: 'Praia, Duna e Areal',
+        24: 'Área Urbanizada',
+        30: 'Mineração',
+        75: 'Usina Fotovoltaica (beta)',
+        25: 'Outras Áreas não Vegetadas',
+
+        33: 'Rio, Lago e Oceano',
+        31: 'Aquicultura',
+
+        27: 'Não observado'
+      },
+      nivel3: {
+        3: 'Formação Florestal',
+        4: 'Formação Savânica',
+        5: 'Mangue',
+        6: 'Floresta Alagável',
+        49: 'Restinga Arbórea',
+
+        11: 'Campo Alagado e Área Pantanosa',
+        12: 'Formação Campestre',
+        32: 'Apicum',
+        29: 'Afloramento Rochoso',
+        50: 'Restinga Herbácea',
+
+        15: 'Pastagem',
+        19: 'Lavoura Temporária',
+        36: 'Lavoura Perene',
+
+        9:  'Silvicultura',
+        21: 'Mosaico de Usos',
+
+        23: 'Praia, Duna e Areal',
+        24: 'Área Urbanizada',
+        30: 'Mineração',
+        75: 'Usina Fotovoltaica (beta)',
+        25: 'Outras Áreas não Vegetadas',
+
+        33: 'Rio, Lago e Oceano',
+        31: 'Aquicultura',
+
+        27: 'Não observado'
+      },
+      nivel4: {
+        3:  'Formação Florestal',
+        4:  'Formação Savânica',
+        5:  'Mangue',
+        6:  'Floresta Alagável',
+        49: 'Restinga Arbórea',
+        11: 'Campo Alagado e Área Pantanosa',
+        12: 'Formação Campestre',
+        32: 'Apicum',
+        29: 'Afloramento Rochoso',
+        50: 'Restinga Herbácea',
+        15: 'Pastagem',
+        39: 'Soja',
+        20: 'Cana',
+        40: 'Arroz',
+        62: 'Algodão (beta)',
+        41: 'Outras Lavouras Temporárias',
+        46: 'Café',
+        47: 'Citrus',
+        35: 'Dendê',
+        48: 'Outras Lavouras Perenes',
+        9:  'Silvicultura',
+        21: 'Mosaico de Usos',
+        23: 'Praia, Duna e Areal',
+        24: 'Área Urbanizada',
+        30: 'Mineração',
+        75: 'Usina Fotovoltaica (beta)',
+        25: 'Outras Áreas não Vegetadas',
+        33: 'Rio, Lago e Oceano',
+        31: 'Aquicultura',
+        27: 'Não observado',
+        0:  'Sem dado'
+      }
+    };
+
+    // Arrays da reclassificação
+    var oldValues = [3, 4, 5, 6, 49, 11, 12, 32, 29, 50, 15, 39, 20, 40, 62, 41, 46, 47, 35, 48, 9, 21, 23, 24, 30, 75, 25, 33, 31, 27, 0];
+    var newValuesByLevel = {
+      nivel4: oldValues,
+      nivel3: [3, 4, 5, 6, 49, 11, 12, 32, 29, 50, 15, 19, 19, 19, 19, 19, 36, 36, 36, 36, 9, 21, 23, 24, 30, 75, 25, 33, 31, 27, 27],
+      nivel2: [3, 4, 5, 6, 49, 11, 12, 32, 29, 50, 15, 18, 18, 18, 18, 18, 18, 18, 18, 18, 9, 21, 23, 24, 30, 75, 25, 33, 31, 27, 27],
+      nivel1: [1, 1, 1, 1, 1, 10, 10, 10, 10, 10, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 14, 22, 22, 22, 22, 22, 26, 26, 27, 27],
+      nivel0: [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 33, 15, 27, 27]
+    };
+
+    // Se não passar argumento → retorna todos os níveis
+    if (!levelsRequested || levelsRequested.length === 0) {
+      levelsRequested = ['nivel0', 'nivel1', 'nivel2', 'nivel3', 'nivel4'];
+    }
+
+    // Função de reclassificação
+    function reclass(img, oldVals, newVals) {
+      var out = img.multiply(0);
+      oldVals.forEach(function(v, i) {
+        out = out.where(img.eq(v), newVals[i]);
+      });
+      return out;
+    }
+
+    // Constrói o objeto de retorno
+    var out = {};
+    levelsRequested.forEach(function(level) {
+      var img = level === 'nivel4'
+        ? coverage // nível 4 é original
+        : reclass(coverage, oldValues, newValuesByLevel[level]);
+
+      out[level] = {
+        eeObject: img,
+        legenda: legend_coverage[level]
+      };
     });
+
     return out;
   }
+}
 
-  // Constrói o objeto de retorno
-  var out = {};
-  levelsRequested.forEach(function(level) {
-    var img = level === 'nivel4'
-      ? coverage // nível 4 é original
-      : reclass(coverage, oldValues, newValuesByLevel[level]);
-
-    out[level] = {
-      eeObject: img,
-      legenda: legend_coverage[level]
-    };
+// ============================================================================
+// ONE RUN: discover stable source feature IDs, then generate every batch.
+//
+// We transfer ONLY source ID strings, not raster results or feature geometry.
+// Sorting the IDs means source records are assigned to deterministic batches.
+// Filtering by 'system:index' avoids FeatureCollection.toList() with large
+// offsets, which is expensive and can cause further memory problems.
+// ============================================================================
+var sourceForIdAudit = ee.FeatureCollection(FIRE_FAPESP_SOURCE_ASSET)
+  .map(function(feature) {
+    feature = ee.Feature(feature);
+    return feature.set('_ff_id_for_batching', feature.id());
   });
 
-  return out;
-}
+print('Reading source feature IDs to generate all 20-record tasks...');
+sourceForIdAudit.aggregate_array('_ff_id_for_batching').evaluate(
+  function(sourceIds, error) {
+    if (error) {
+      print('ERROR: Could not list source IDs:', error);
+      return;
+    }
+    if (!Array.isArray(sourceIds)) {
+      print('ERROR: Expected an array of source IDs. No export tasks created.');
+      return;
+    }
+    var sourceCount = sourceIds.length;
+    if (sourceCount === 0) {
+      print('No records found in source asset.');
+      return;
+    }
+    // IMPORTANT: Never silently exclude IDs without inspecting them.
+    for (var c = 0; c < sourceIds.length; c++) {
+      if (sourceIds[c] === null || sourceIds[c] === undefined ||
+          String(sourceIds[c]).length === 0) {
+        print('ERROR: Empty feature ID at source position', c);
+        return;
+      }
+      sourceIds[c] = String(sourceIds[c]);
+    }
+    sourceIds.sort();
+    for (var j = 1; j < sourceIds.length; j++) {
+      if (sourceIds[j] === sourceIds[j - 1]) {
+        print('ERROR: Non-unique source feature ID:', sourceIds[j]);
+        return;
+      }
+    }
+    var totalBatches = Math.ceil(sourceCount / BATCH_SIZE);
+    print('Source records:', sourceCount);
+    print('Records per task (max):', BATCH_SIZE);
+    print('Total independent exports:', totalBatches);
+    if (totalBatches > MAX_BATCHES_TO_QUEUE) {
+      print('STOP: ' + totalBatches + ' tasks would exceed the queue limit ' +
+            'of ' + MAX_BATCHES_TO_QUEUE + '. No tasks created. ' +
+            'Increase BATCH_SIZE or queue ranges in separate runs.');
+      return;
+    }
+    var queued = 0;
+    for (var b = 0; b < totalBatches; b++) {
+      var batchNumber = b + 1;
+      if (ONLY_BATCH_NUMBERS.length > 0 &&
+          ONLY_BATCH_NUMBERS.indexOf(batchNumber) === -1) {
+        continue;
+      }
+      var first = b * BATCH_SIZE;
+      var selectedIds = sourceIds.slice(first, first + BATCH_SIZE);
+      queueFullOriginalMetricsForBatch(b, selectedIds, totalBatches);
+      queued++;
+    }
+    print('Export tasks generated:', queued);
+    print('Expected CSV prefix:', OUTPUT_PREFIX);
+    print('Batches are in the Tasks tab as UNSUBMITTED. Start them there.');
+  }
+);
